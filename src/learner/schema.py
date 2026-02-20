@@ -1,15 +1,16 @@
 """
 거래 관련 데이터 모델 및 스키마 정의 모듈.
+Pydantic V2 규격에 맞게 수정.
 """
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class TradeEvent(BaseModel):
     """실시간 거래 이벤트 데이터 모델."""
     trace_id: str
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
     exchange: str
     symbol: str
     side: str
@@ -21,19 +22,15 @@ class TradeEvent(BaseModel):
 
 class FeatureSet(BaseModel):
     """모델 입력용 피처 세트."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
     event_id: str
     timestamp: datetime
-    # 시장 상태 피처
     spread: float
     vwap_1m: float
     volume_1m: float
-    # 거래소 메타
     liquidity_score: float
-    # 파생 피처
     volatility_5m: float
-    
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class Prediction(BaseModel):
@@ -46,7 +43,7 @@ class Prediction(BaseModel):
 
 
 class ExecutionResult(BaseModel):
-    """실제 체결 결과 (라벨링용)."""
+    """실제 체결 결과."""
     order_id: str
     feature_set_id: str
     actual_slippage: float
