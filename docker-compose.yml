@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: coin-trading-bot
+    # 24시간 꺼지지 않게 하는 핵심 설정 (비정상 종료 시 무조건 재시작)
+    restart: always
+    # 환경 변수 파일을 읽어서 API 키 등을 안전하게 사용
+    env_file:
+      - .env
+    # 실시간 로그를 서버에서도 바로 볼 수 있도록 설정
+    environment:
+      - PYTHONUNBUFFERED=1
+    # 로그가 너무 많이 쌓이지 않게 관리
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10mb"
+        max-file: "3"

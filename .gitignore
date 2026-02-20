@@ -1,13 +1,20 @@
-# Node.js
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# 1. 파이썬 관련 임시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.pytest_cache/
+
+# 2. 민감한 설정 (절대로 깃에 올리면 안 됨)
 .env
+secret.json
+api_keys.py
 
-# VS Code
-.vscode/
+# 3. 데이터 및 로그 파일
+*.log
+data/
+db.sqlite3
 
-# OS
-.DS_Store
-Thumbs.db
+# 4. 도커 관련 임시 파일
+docker-compose.override.yml
