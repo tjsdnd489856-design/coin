@@ -44,20 +44,32 @@ class ExchangeConnector:
             return {}
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1d', limit: int = 2) -> List[List[Any]]:
-        """과거 캔들 데이터(시가, 고가, 저가, 종가, 거래량) 조회."""
+        """과거 캔들 데이터 조회."""
         try:
-            # 기본적으로 최근 2일 데이터를 가져옴 (어제 데이터 계산용)
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             return ohlcv
         except Exception as e:
             logger.error(f"OHLCV 데이터 조회 에러: {e}")
             return []
 
+    async def fetch_balance(self) -> Dict[str, Any]:
+        """계좌 잔고 조회."""
+        if self.is_dry_run:
+            # 테스트 모드일 때는 가상의 10,000 USDT 반환
+            return {"free": {"USDT": 10000.0}, "total": {"USDT": 10000.0}}
+            
+        try:
+            balance = await self.exchange.fetch_balance()
+            return balance
+        except Exception as e:
+            logger.error(f"잔고 조회 에러: {e}")
+            return {}
+
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None) -> Dict[str, Any]:
-        """주문 실행 (매수/매도)."""
+        """주문 실행."""
         if self.is_dry_run:
             logger.info(f"[DRY_RUN] 주문 시뮬레이션: {side} {amount} {symbol}")
-            return {"id": "dry_run_id", "status": "simulated"}
+            return {"id": "dry_run_id", "status": "closed", "price": price or 1.0}
 
         try:
             if price:
