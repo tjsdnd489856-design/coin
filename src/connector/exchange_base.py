@@ -4,7 +4,7 @@ ccxt 라이브러리를 사용하여 범용성을 확보.
 """
 import os
 import ccxt.async_support as ccxt
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from src.learner.utils import get_logger
 
 logger = get_logger(__name__)
@@ -31,7 +31,6 @@ class ExchangeConnector:
             'apiKey': self.api_key,
             'secret': self.secret_key,
             'enableRateLimit': True,
-            # 테스트망(Testnet) 지원 여부 확인
             'options': {'defaultType': 'spot'}
         })
 
@@ -39,11 +38,20 @@ class ExchangeConnector:
         """현재가 및 시세 정보 조회."""
         try:
             ticker = await self.exchange.fetch_ticker(symbol)
-            logger.info(f"[{self.exchange_id}] {symbol} 현재가: {ticker['last']}")
             return ticker
         except Exception as e:
             logger.error(f"시세 조회 에러: {e}")
             return {}
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = '1d', limit: int = 2) -> List[List[Any]]:
+        """과거 캔들 데이터(시가, 고가, 저가, 종가, 거래량) 조회."""
+        try:
+            # 기본적으로 최근 2일 데이터를 가져옴 (어제 데이터 계산용)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            return ohlcv
+        except Exception as e:
+            logger.error(f"OHLCV 데이터 조회 에러: {e}")
+            return []
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None) -> Dict[str, Any]:
         """주문 실행 (매수/매도)."""
@@ -53,10 +61,8 @@ class ExchangeConnector:
 
         try:
             if price:
-                # 지정가 주문
                 order = await self.exchange.create_limit_order(symbol, side, amount, price)
             else:
-                # 시장가 주문
                 order = await self.exchange.create_market_order(symbol, side, amount)
             
             logger.info(f"주문 성공: {order['id']}")
