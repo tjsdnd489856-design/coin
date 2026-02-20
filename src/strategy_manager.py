@@ -11,7 +11,7 @@ from src.learner.schema import TradeEvent
 from src.strategy.scalping_strategy import ScalpingStrategy
 from src.strategy.reversal_strategy import ReversalStrategy
 from src.notifier.telegram_notifier import TelegramNotifier
-from src.learner.utils import get_logger
+from src.learner.utils import get_logger, now_utc
 
 logger = get_logger(__name__)
 
@@ -65,9 +65,11 @@ class StrategyManager:
 
                     # A. 매수 탐색 (포지션이 없을 때)
                     if not data['position']:
+                        # AI 예측을 위한 이벤트 생성 (timestamp를 현재 시간으로 설정)
                         event = TradeEvent(
                             trace_id=f"t_{int(asyncio.get_event_loop().time())}",
-                            timestamp=None, exchange=self.connector.exchange_id,
+                            timestamp=now_utc(), 
+                            exchange=self.connector.exchange_id,
                             symbol=symbol, side="buy", price=ticker['last'], quantity=0.001
                         )
                         ai_pred = await self.learner.predict(event)
@@ -76,7 +78,7 @@ class StrategyManager:
                         if await data['strategies']['trend'].check_signal(ticker, ai_pred.dict()):
                             await self._execute_buy(symbol, ticker, "trend")
                             
-                        # 2. 역추세 전략 체크 (추세 신호가 없을 때만 혹은 별개로 수행 가능)
+                        # 2. 역추세 전략 체크
                         elif await data['strategies']['reversal'].check_signal(ticker, ai_pred.dict()):
                             await self._execute_buy(symbol, ticker, "reversal")
                     
