@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, ConfigDict
 class TradeEvent(BaseModel):
     """실시간 거래 이벤트 데이터 모델."""
     trace_id: str
-    timestamp: Optional[datetime] = None
+    timestamp: Optional[datetime] = Field(default_factory=None)
     exchange: str
     symbol: str
     side: str
@@ -25,7 +25,7 @@ class FeatureSet(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     event_id: str
-    timestamp: datetime
+    timestamp: datetime = Field(default_factory=datetime.now) # 기본값 설정으로 에러 방지
     spread: float
     vwap_1m: float
     volume_1m: float
