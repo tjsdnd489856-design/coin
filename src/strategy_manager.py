@@ -29,7 +29,6 @@ class StrategyManager:
         symbols_str = os.getenv("SYMBOL_LIST", "BTC/KRW,ETH/KRW,XRP/KRW")
         self.symbols = [s.strip() for s in symbols_str.split(",")]
         
-        # 코인별 데이터 구조
         self.coin_data = {}
         for symbol in self.symbols:
             self.coin_data[symbol] = {
@@ -40,25 +39,27 @@ class StrategyManager:
                 'position': None,
             }
         
-        # 정기 보고용 변수
-        self.last_report_date = "" # 마지막으로 보고서를 보낸 날짜 (YYYY-MM-DD)
+        self.last_report_date = "" 
+        self.last_heartbeat_hour = -1 # 마지막으로 생존 신고를 한 시간
 
     async def _update_all_indicators(self):
         """모든 전략의 지표 갱신."""
         logger.info("모든 전략의 지표 갱신 시작...")
         for symbol in self.symbols:
-            ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1d', limit=50)
-            if len(ohlcv) >= 20:
-                for s_name, strategy in self.coin_data[symbol]['strategies'].items():
-                    await strategy.update_indicators(ohlcv)
-            await asyncio.sleep(0.1)
+            try:
+                ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1d', limit=50)
+                if len(ohlcv) >= 20:
+                    for s_name, strategy in self.coin_data[symbol]['strategies'].items():
+                        await strategy.update_indicators(ohlcv)
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                logger.error(f"[{symbol}] 지표 갱신 에러: {e}")
 
     async def _send_daily_report(self):
         """매일 오전 정기 자산 및 시장 상태 보고."""
         try:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
-            total_equity = balance.get('total', {}).get('KRW', krw_free) # 단순화된 계산
             
             report_msg = "📊 [정기 보고서] 현재 시스템 상태\n\n"
             report_msg += f"💰 가용 원화: {krw_free:,.0f}원\n"
@@ -83,24 +84,31 @@ class StrategyManager:
 
     async def start(self):
         self.is_running = True
-        await self.notifier.send_message(f"🚀 듀얼 전략 시스템 가동: {', '.join(self.symbols)}\n(정기 보고: 매일 오전 10시)")
+        await self.notifier.send_message(f"🚀 자동 매매 시스템 가동 중\n(감시 코인: {', '.join(self.symbols)})")
         await self._update_all_indicators()
 
         while self.is_running:
-            now = now_utc()
-            
-            # [추가] 매일 오전 10시 정기 보고 체크
-            # 한국 시간 기준 (GCP 서버는 UTC일 수 있으므로 시간 계산 주의)
-            # 여기서는 9시간 차이를 고려하거나, 단순하게 로컬 시간 기준 10시 체크
-            current_date = now.strftime("%Y-%m-%d")
-            if now.hour == 10 and self.last_report_date != current_date:
-                await self._send_daily_report()
-                self.last_report_date = current_date
-                # 지표도 하루 한 번 이때 갱신
-                await self._update_all_indicators()
+            try:
+                now = now_utc()
+                current_date = now.strftime("%Y-%m-%d")
+                
+                # 1. 매일 오전 10시 상세 보고
+                if now.hour == 10 and self.last_report_date != current_date:
+                    await self._send_daily_report()
+                    self.last_report_date = current_date
+                    await self._update_all_indicators()
 
-            for symbol in self.symbols:
-                try:
+                # 2. 매시간 정각 "나 살아있어요" 생존 신고 (Heartbeat)
+                if now.hour != self.last_heartbeat_hour:
+                    logger.info(f"시스템 생존 신고 (현재 시간: {now.hour}시)")
+                    self.last_heartbeat_hour = now.hour
+                    # 너무 자주 오면 시끄러우니 6시간마다 혹은 로그로만 남길 수도 있음
+                    # 여기서는 6시간마다 텔레그램으로 보냄
+                    if now.hour % 6 == 0:
+                        await self.notifier.send_message(f"✅ 시스템 정상 가동 중... ({now.hour}시)")
+
+                # 3. 각 코인 매매 로직
+                for symbol in self.symbols:
                     data = self.coin_data[symbol]
                     ticker = await self.connector.fetch_ticker(symbol)
                     if not ticker: continue
@@ -128,15 +136,14 @@ class StrategyManager:
                             if order:
                                 pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
                                 await self.notifier.send_message(
-                                    f"📢 [{exit_type}] {symbol}\n"
-                                    f"전략: {pos['strategy_type']}\n"
-                                    f"수익률: {pnl:.2f}%"
+                                    f"📢 [{exit_type}] {symbol}\n전략: {pos['strategy_type']}\n수익률: {pnl:.2f}%"
                                 )
                                 data['position'] = None
-
                     await asyncio.sleep(0.2)
-                except Exception as e:
-                    logger.error(f"[{symbol}] 루프 에러: {e}")
+
+            except Exception as e:
+                logger.error(f"메인 루프 치명적 에러: {e}")
+                await asyncio.sleep(10) # 에러 시 잠시 대기 후 재시도
 
             await asyncio.sleep(1)
 
@@ -152,16 +159,8 @@ class StrategyManager:
         if (amount * ticker['last']) > 5000:
             order = await self.connector.create_order(symbol, "buy", amount)
             if order:
-                data['position'] = {
-                    'entry_price': ticker['last'], 
-                    'amount': amount,
-                    'strategy_type': strategy_type
-                }
-                await self.notifier.send_message(
-                    f"🔔 [매수] {symbol} ({strategy_type})\n"
-                    f"가격: {ticker['last']:,.0f}원\n"
-                    f"RSI: {strategy.rsi:.2f}"
-                )
+                data['position'] = {'entry_price': ticker['last'], 'amount': amount, 'strategy_type': strategy_type}
+                await self.notifier.send_message(f"🔔 [매수] {symbol} ({strategy_type})\n가격: {ticker['last']:,.0f}원")
 
     def stop(self):
         self.is_running = False
