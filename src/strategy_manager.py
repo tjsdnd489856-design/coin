@@ -170,10 +170,14 @@ class StrategyManager:
             krw_free = balance.get('free', {}).get('KRW', 0)
             invest_krw = krw_free / (len(self.symbols) + 1)
             if invest_krw < 5000: return
+            
             strategy = self.coin_data[symbol]['strategies'][strategy_type]
-            amount = strategy.calculate_amount(invest_krw, ticker['last'])
-            order = await self.connector.create_order(symbol, "buy", amount)
+            # 업비트 시장가 매수는 수량이 아닌 '투자 금액'을 amount 자리에 넣어야 함
+            order = await self.connector.create_order(symbol, "buy", invest_krw)
+            
             if order:
+                # 내부 포지션 관리를 위해 실제 체결 수량 계산 (또는 ticker 기준 계산)
+                amount = strategy.calculate_amount(invest_krw, ticker['last'])
                 self.coin_data[symbol]['position'] = {'entry_price': ticker['last'], 'amount': amount, 'strategy_type': strategy_type}
                 await self.notifier.send_message(f"🚀 [매수 완료] {symbol}\n전략: {strategy_type}")
         except Exception as e:

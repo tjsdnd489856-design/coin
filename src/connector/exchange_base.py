@@ -31,6 +31,9 @@ class ExchangeConnector:
             'apiKey': self.api_key,
             'secret': self.secret_key,
             'enableRateLimit': True,
+            'options': {
+                'createMarketBuyOrderRequiresPrice': False,
+            }
         })
 
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
