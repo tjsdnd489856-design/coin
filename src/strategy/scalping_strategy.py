@@ -1,103 +1,90 @@
 """
-고승률을 위한 변동성 응축(Squeeze) 및 모멘텀 필터 적용 스캘핑 전략.
-1분 봉의 가짜 신호를 극도로 제한함.
+AI 적응형 파라미터(TradeParams)를 수용하는 스캘핑 전략.
 """
 import pandas as pd
 from typing import Dict, Any, Optional, List
 from .base_strategy import BaseStrategy
+from src.learner.schema import TradeParams
 from src.learner.utils import get_logger
 
 logger = get_logger(__name__)
 
 
 class ScalpingStrategy(BaseStrategy):
-    """1분 봉 고승률 타겟 스캘핑 전략."""
+    """AI가 주는 파라미터로 실시간 튜닝되는 스캘핑 전략."""
 
-    def __init__(self, k: float = 0.6, stop_loss_pct: float = 0.005, take_profit_pct: float = 0.012):
+    def __init__(self, k: float = 0.6):
         self.k = k
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
+        self.stop_loss_pct = 0.005
+        self.take_profit_pct = 0.012
+        self.volume_multiplier = 2.0 # 기본값
         
-        # 지표 저장소
+        # 지표
         self.target_price = None
         self.ma_20 = None
         self.rsi = None
-        self.prev_rsi = None
         self.avg_volume = None
-        self.bb_width = None # 밴드 너비 (응축도 확인용)
+        self.bb_width = None
 
     async def update_indicators(self, ohlcv_list: List[List[Any]]):
-        """지표 업데이트 및 응축도 계산."""
-        if not ohlcv_list or len(ohlcv_list) < 30:
-            return
-        
+        if not ohlcv_list or len(ohlcv_list) < 30: return
         df = pd.DataFrame(ohlcv_list, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
         
-        # 1. 목표가 및 이평선
+        # 목표가는 k값이 변동되므로 check_signal 시점에 계산하는 게 좋지만,
+        # 여기선 기본값으로 계산해두고 signal 체크 때 덮어씌움
         prev_candle = df.iloc[-2]
-        prev_range = prev_candle['high'] - prev_candle['low']
-        self.target_price = df.iloc[-1]['open'] + (prev_range * self.k)
-        self.ma_20 = df['close'].rolling(window=20).mean().iloc[-1]
+        self.prev_range = prev_candle['high'] - prev_candle['low']
+        self.current_open = df.iloc[-1]['open']
         
-        # 2. RSI 및 모멘텀(기울기) 계산
+        self.ma_20 = df['close'].rolling(20).mean().iloc[-1]
+        
+        # RSI 등 보조지표 계산
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rsi_series = 100 - (100 / (1 + (gain / loss)))
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        self.rsi = (100 - (100 / (1 + (gain / loss)))).iloc[-1]
         
-        self.prev_rsi = rsi_series.iloc[-2]
-        self.rsi = rsi_series.iloc[-1]
+        ma20 = df['close'].rolling(20).mean()
+        std20 = df['close'].rolling(20).std()
+        upper = ma20 + (2*std20)
+        lower = ma20 - (2*std20)
+        self.bb_width = ((upper - lower) / ma20).iloc[-1]
         
-        # 3. 볼린저 밴드 너비(BB Width)로 응축도 계산
-        ma20 = df['close'].rolling(window=20).mean()
-        std20 = df['close'].rolling(window=20).std()
-        upper_bb = ma20 + (2 * std20)
-        lower_bb = ma20 - (2 * std20)
-        # 밴드 폭이 좁을수록 힘이 응축됨
-        self.bb_width = (upper_bb - lower_bb) / ma20
-        self.bb_width = self.bb_width.iloc[-1]
-        
-        # 4. 거래량 필터
         self.avg_volume = df['volume'].iloc[-21:-1].mean()
 
     async def check_signal(self, current_data: Dict[str, Any], ai_pred: Dict[str, Any] = None) -> bool:
-        """강화된 4중 필터 승률 전략."""
-        if self.target_price is None or self.bb_width is None:
-            return False
-            
+        """AI가 제안한 파라미터(params)를 우선 적용."""
+        if self.ma_20 is None: return False
+        
+        # [핵심] AI가 제안한 파라미터 적용 (없으면 기본값)
+        params = ai_pred.get('suggested_params', {}) if ai_pred else {}
+        # Pydantic 모델이 dict로 변환되어 들어옴
+        k = params.get('k', self.k)
+        vol_mult = params.get('volume_multiplier', self.volume_multiplier)
+        
+        # 동적 목표가 재계산
+        target_price = self.current_open + (self.prev_range * k)
+        
         current_price = current_data['last']
-        current_volume = current_data.get('baseVolume', 0)
+        current_vol = current_data.get('baseVolume', 0)
         
-        # 필터 1: 가격 돌파 및 상승 추세
-        price_condition = current_price >= self.target_price and current_price > self.ma_20
+        # 1. 가격 돌파
+        cond_price = current_price >= target_price and current_price > self.ma_20
+        # 2. 거래량 (AI가 정해준 배수)
+        cond_vol = self.avg_volume and current_vol > (self.avg_volume * vol_mult)
+        # 3. 응축 (선택)
+        cond_squeeze = self.bb_width < 0.025
         
-        # 필터 2: 변동성 응축 확인 (밴드 너비가 너무 넓으면 이미 슈팅한 것이므로 제외)
-        # 밴드 폭이 평소보다 좁은 상태에서 터지는 것만 잡음
-        is_squeezed = self.bb_width < 0.02 # 2% 이내로 응축된 상태일 때만
-        
-        # 필터 3: 모멘텀 가속도 (RSI가 이전 봉보다 상승 중이어야 함)
-        is_momentum_up = False
-        if self.rsi and self.prev_rsi:
-            is_momentum_up = self.rsi > self.prev_rsi
-            
-        # 필터 4: 거래량 폭발 (평균의 2.5배 이상)
-        is_volume_spike = False
-        if self.avg_volume and current_volume > (self.avg_volume * 2.5):
-            is_volume_spike = True
-            
-        if price_condition and is_momentum_up and is_volume_spike:
-            # Squeeze 조건은 선택적으로 적용 (너무 빡빡하면 거래가 안 터지므로 로그로 확인)
-            logger.info(f"✨ 고승률 타점 발견! RSI: {self.rsi:.2f}, BB_Width: {self.bb_width:.4f}")
+        if cond_price and cond_vol and cond_squeeze:
+            logger.info(f"✨ AI 스캘핑 신호 (k={k:.2f}, vol_x={vol_mult:.1f})")
             return True
             
         return False
 
     def check_exit_signal(self, entry_price: float, current_price: float) -> Optional[str]:
         pnl = (current_price - entry_price) / entry_price
-        if pnl >= self.take_profit_pct:
-            return "HIGH_PROB_TP"
-        if pnl <= -self.stop_loss_pct:
-            return "HIGH_PROB_SL"
+        if pnl >= self.take_profit_pct: return "AI_TP"
+        if pnl <= -self.stop_loss_pct: return "AI_SL"
         return None
 
     def calculate_amount(self, balance: float, price: float) -> float:
