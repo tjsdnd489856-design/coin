@@ -4,6 +4,7 @@
 """
 import asyncio
 import os
+import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, List
 from src.connector.exchange_base import ExchangeConnector
@@ -41,14 +42,33 @@ class StrategyManager:
         self.is_market_safe = True
 
     async def _check_market_sentiment(self):
-        """시장 건전성 체크."""
+        """시장 건전성 및 추세 체크 (EMA 정배열 및 변동성 확인)."""
         try:
-            btc_ohlcv = await self.connector.fetch_ohlcv("BTC/KRW", timeframe='1m', limit=5)
-            if btc_ohlcv and len(btc_ohlcv) >= 5:
-                change_pct = (btc_ohlcv[-1][4] - btc_ohlcv[0][4]) / btc_ohlcv[0][4]
-                self.is_market_safe = change_pct > -0.005
-        except Exception:
-            pass
+            # BTC 1분봉 60개를 가져와서 단기/장기 추세 분석
+            btc_ohlcv = await self.connector.fetch_ohlcv("BTC/KRW", timeframe='1m', limit=60)
+            if btc_ohlcv and len(btc_ohlcv) >= 60:
+                df = pd.DataFrame(btc_ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+                
+                # 1. 가격 변화율
+                change_pct = (df['c'].iloc[-1] - df['c'].iloc[-5]) / df['c'].iloc[-5]
+                
+                # 2. EMA 추세 (단기 10, 장기 30)
+                ema10 = df['c'].ewm(span=10).mean().iloc[-1]
+                ema30 = df['c'].ewm(span=30).mean().iloc[-1]
+                is_uptrend = ema10 > ema30
+                
+                # 3. 변동성 (너무 낮으면 횡보장으로 판단하여 제외)
+                std_dev = df['c'].iloc[-20:].std() / df['c'].iloc[-1]
+                is_volatile = std_dev > 0.0005 # 0.05% 이상의 변동성 필요
+                
+                # 급락 중이 아니고, 추세가 살아있거나 변동성이 적정할 때만 안전으로 판단
+                self.is_market_safe = change_pct > -0.003 and (is_uptrend or is_volatile)
+                
+                if not self.is_market_safe:
+                    logger.warning(f"⚠️ 시장 주의 상태 (Change: {change_pct:.2%}, Uptrend: {is_uptrend}, Vol: {std_dev:.4f})")
+        except Exception as e:
+            logger.error(f"시장 감지 오류: {e}")
+            self.is_market_safe = True # 에러 시 기본값은 True로 유지하되 로그 남김
 
     async def _update_all_indicators(self):
         """지표 최신화."""
