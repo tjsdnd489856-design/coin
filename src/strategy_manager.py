@@ -1,6 +1,6 @@
 """
-멀티 코인 및 멀티 전략 관리자.
-AI 자가 학습 피드백(ExecutionResult) 루프 연동.
+멀티 코인 및 멀티 전략 관리자 (최종 완성본).
+AI 자가 학습, 시장 필터링, 안정적 예외 처리가 통합된 최상위 엔진.
 """
 import asyncio
 import os
@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 
 class StrategyManager:
-    """AI 자가 학습 기반의 지능형 관리자."""
+    """모든 변수를 통제하는 지능형 매매 관리자."""
 
     def __init__(self):
         self.connector = ExchangeConnector()
@@ -40,92 +40,93 @@ class StrategyManager:
         self.is_market_safe = True
 
     async def _check_market_sentiment(self):
-        """비트코인 상태 체크 (시장 지수)."""
+        """비트코인(BTC) 기준 시장 건전성 체크."""
         try:
             btc_ohlcv = await self.connector.fetch_ohlcv("BTC/KRW", timeframe='1m', limit=5)
-            if len(btc_ohlcv) < 5: return
-            change_pct = (btc_ohlcv[-1][4] - btc_ohlcv[0][4]) / btc_ohlcv[0][4]
-            self.is_market_safe = change_pct > -0.005 # 5분간 -0.5% 이상 하락 시 위험
+            if btc_ohlcv and len(btc_ohlcv) >= 5:
+                change_pct = (btc_ohlcv[-1][4] - btc_ohlcv[0][4]) / btc_ohlcv[0][4]
+                # 급락 장세(-0.5% 초과 하락) 시 안전 모드 가동
+                self.is_market_safe = change_pct > -0.005
         except Exception as e:
-            logger.error(f"Market sentiment error: {e}")
+            logger.error(f"시장 심리 분석 실패: {e}")
 
     async def _update_all_indicators(self):
-        """1분 봉 지표 갱신."""
+        """1분 봉 지표 실시간 최신화."""
         for symbol in self.symbols:
             try:
-                ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=100)
-                if len(ohlcv) >= 30:
+                ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=50)
+                if ohlcv and len(ohlcv) >= 30:
                     for strategy in self.coin_data[symbol]['strategies'].values():
                         await strategy.update_indicators(ohlcv)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.2)
             except Exception as e:
-                logger.error(f"[{symbol}] Indicator update error: {e}")
+                logger.error(f"[{symbol}] 지표 업데이트 실패: {e}")
         self.last_indicator_update = now_utc()
 
     async def start(self):
-        """메인 매매 루프 시작."""
+        """매매 시스템 메인 루프 가동."""
         self.is_running = True
-        await self.notifier.send_message("🚀 AI 자가 학습 및 적응형 매매 엔진 가동")
+        await self.notifier.send_message("💎 AI 지능형 매매 시스템 가동 (완성본)")
         await self._update_all_indicators()
 
         while self.is_running:
             try:
                 now = now_utc()
+                # 텔레그램 명령 및 시장 상태 수시 체크
                 await self.notifier.get_recent_command()
                 await self._check_market_sentiment()
 
+                # 1. 지표 갱신 (60초 주기)
                 if self.last_indicator_update is None or (now - self.last_indicator_update).total_seconds() >= 60:
                     await self._update_all_indicators()
 
+                # 2. 각 코인별 매매 감시
                 for symbol in self.symbols:
-                    data = self.coin_data[symbol]
-                    ticker = await self.connector.fetch_ticker(symbol)
-                    if not ticker: continue
+                    try:
+                        data = self.coin_data[symbol]
+                        ticker = await self.connector.fetch_ticker(symbol)
+                        if not ticker: continue
 
-                    # [핵심] 매수 신호 감시
-                    if not data['position']:
-                        if not self.is_market_safe: continue
-                        
-                        # AI에게 현재 상황에 맞는 최적 파라미터 예측 요청
-                        event = TradeEvent(trace_id=f"t_{int(now.timestamp())}", symbol=symbol, side="buy", price=ticker['last'], quantity=0)
-                        ai_pred = await self.learner.predict(event)
-                        
-                        # AI가 준 파라미터(ai_pred.dict())로 전략 체크
-                        if await data['strategies']['trend'].check_signal(ticker, ai_pred.model_dump()):
-                            await self._execute_buy(symbol, ticker, "trend")
-                        elif await data['strategies']['reversal'].check_signal(ticker, ai_pred.model_dump()):
-                            await self._execute_buy(symbol, ticker, "reversal")
-                    
-                    # [핵심] 매도 신호 감시 및 피드백 학습
-                    else:
-                        pos = data['position']
-                        strategy = data['strategies'][pos['strategy_type']]
-                        exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'])
-                        
-                        if exit_type:
-                            order = await self.connector.create_order(symbol, "sell", pos['amount'])
-                            if order:
-                                pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
-                                await self.notifier.send_message(f"📢 [매도] {symbol} ({exit_type}) 수익: {pnl:.2f}%")
-                                
-                                # AI에게 매매 결과 피드백 (PnL 포함)
-                                result = ExecutionResult(
-                                    order_id=order.get('id', 'unknown'),
-                                    filled_price=ticker['last'],
-                                    filled_quantity=pos['amount'],
-                                    pnl_pct=pnl / 100.0, # 학습용 수익률
-                                    strategy_type=pos['strategy_type']
-                                )
-                                await self.learner.feedback(result)
-                                
-                                data['position'] = None
+                        if not data['position']:
+                            if not self.is_market_safe: continue # 하락장 매수 금지
+                            
+                            # AI 최적 파라미터 예측 및 신호 체크
+                            event = TradeEvent(trace_id=f"t_{int(now.timestamp())}", symbol=symbol, side="buy", price=ticker['last'], quantity=0)
+                            ai_pred = await self.learner.predict(event)
+                            
+                            pred_dict = ai_pred.model_dump()
+                            if await data['strategies']['trend'].check_signal(ticker, pred_dict):
+                                await self._execute_buy(symbol, ticker, "trend")
+                            elif await data['strategies']['reversal'].check_signal(ticker, pred_dict):
+                                await self._execute_buy(symbol, ticker, "reversal")
+                        else:
+                            # 매도 및 학습 피드백
+                            pos = data['position']
+                            strategy = data['strategies'][pos['strategy_type']]
+                            exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'])
+                            
+                            if exit_type:
+                                order = await self.connector.create_order(symbol, "sell", pos['amount'])
+                                if order:
+                                    pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
+                                    await self.notifier.send_message(f"💰 [매도 완료] {symbol}\n수익률: {pnl:.2f}% ({exit_type})")
+                                    # 결과 학습
+                                    await self.learner.feedback(ExecutionResult(
+                                        order_id=order.get('id', 'unknown'), filled_price=ticker['last'], 
+                                        pnl_pct=pnl/100.0, strategy_type=pos['strategy_type']
+                                    ))
+                                    data['position'] = None
+                    except Exception as coin_err:
+                        logger.error(f"[{symbol}] 루프 중 오류: {coin_err}")
                     await asyncio.sleep(0.1)
+
             except Exception as e:
-                logger.error(f"Loop error: {e}")
-                await asyncio.sleep(1)
+                logger.error(f"메인 루프 치명적 오류: {e}")
+                await asyncio.sleep(2)
             await asyncio.sleep(0.5)
 
     async def _execute_buy(self, symbol: str, ticker: Dict[str, Any], strategy_type: str):
+        """매수 주문 실행."""
         try:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
@@ -138,9 +139,9 @@ class StrategyManager:
             order = await self.connector.create_order(symbol, "buy", amount)
             if order:
                 self.coin_data[symbol]['position'] = {'entry_price': ticker['last'], 'amount': amount, 'strategy_type': strategy_type}
-                await self.notifier.send_message(f"🔔 [매수] {symbol} ({strategy_type})")
+                await self.notifier.send_message(f"🚀 [매수 완료] {symbol}\n전략: {strategy_type}")
         except Exception as e:
-            logger.error(f"[{symbol}] 매수 실패: {e}")
+            logger.error(f"[{symbol}] 매수 주문 실패: {e}")
 
     def stop(self):
         self.is_running = False
