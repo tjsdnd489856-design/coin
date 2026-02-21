@@ -1,6 +1,6 @@
 """
-멀티 코인 및 멀티 전략 관리자 (최종 안정화 버전).
-가시성 높은 로그 및 최적화된 루프 적용.
+멀티 코인 및 멀티 전략 관리자 (하트비트 주기 조정 및 보고 기능 강화).
+사용자 명령어 인식률을 높이고 로그 출력을 최적화함.
 """
 import asyncio
 import os
@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 
 class StrategyManager:
-    """모든 변수를 통제하는 지능형 매매 관리자."""
+    """1시간 주기 하트비트 및 강화된 보고 기능을 갖춘 관리자."""
 
     def __init__(self):
         self.connector = ExchangeConnector()
@@ -41,17 +41,17 @@ class StrategyManager:
         self.is_market_safe = True
 
     async def _check_market_sentiment(self):
-        """비트코인 기준 시장 건전성 체크."""
+        """시장 건전성 체크."""
         try:
             btc_ohlcv = await self.connector.fetch_ohlcv("BTC/KRW", timeframe='1m', limit=5)
             if btc_ohlcv and len(btc_ohlcv) >= 5:
                 change_pct = (btc_ohlcv[-1][4] - btc_ohlcv[0][4]) / btc_ohlcv[0][4]
                 self.is_market_safe = change_pct > -0.005
         except Exception:
-            pass # 단순 조회 실패는 무시
+            pass
 
     async def _update_all_indicators(self):
-        """1분 봉 지표 실시간 최신화."""
+        """지표 최신화."""
         logger.info("📡 1분 봉 지표 및 AI 모델 동기화 중...")
         for symbol in self.symbols:
             try:
@@ -65,31 +65,29 @@ class StrategyManager:
         self.last_indicator_update = now_utc()
 
     async def start(self):
-        """매매 시스템 메인 루프 가동."""
+        """메인 매매 루프."""
         self.is_running = True
-        await self.notifier.send_message("💎 AI 지능형 매매 시스템 가동 (최종 안정화 버전)")
+        await self.notifier.send_message("💎 AI 지능형 매매 시스템 가동 (명령어 인식 강화)")
         await self._update_all_indicators()
 
         while self.is_running:
             try:
                 now = now_utc()
                 
-                # 1. 텔레그램 명령 처리
+                # 1. 텔레그램 명령 처리 (강화된 인식)
                 cmd = await self.notifier.get_recent_command()
-                if cmd == "보고":
+                if cmd and "보고" in cmd:
                     await self._send_status_report()
 
-                # 2. 5분마다 하트비트 로그 출력 (정상 작동 확인용)
-                if self.last_heartbeat_time is None or (now - self.last_heartbeat_time).total_seconds() >= 300:
-                    logger.info(f"💓 시스템 정상 가동 중... (시장안전: {self.is_market_safe})")
+                # 2. 1시간(3600초)마다 하트비트 로그 출력
+                if self.last_heartbeat_time is None or (now - self.last_heartbeat_time).total_seconds() >= 3600:
+                    logger.info(f"💓 [정상 가동 중] 시장안전: {self.is_market_safe} | 코인: {', '.join(self.symbols)}")
                     self.last_heartbeat_time = now
 
-                # 3. 비트코인 시황 및 지표 갱신
                 await self._check_market_sentiment()
                 if self.last_indicator_update is None or (now - self.last_indicator_update).total_seconds() >= 60:
                     await self._update_all_indicators()
 
-                # 4. 코인별 매매 신호 감시
                 for symbol in self.symbols:
                     try:
                         data = self.coin_data[symbol]
@@ -120,7 +118,7 @@ class StrategyManager:
                                     await self.learner.feedback(ExecutionResult(order_id=order.get('id', 'unknown'), filled_price=ticker['last'], pnl_pct=pnl/100.0, strategy_type=pos['strategy_type']))
                                     data['position'] = None
                     except Exception:
-                        pass # 개별 코인 에러는 넘김
+                        pass
                     await asyncio.sleep(0.05)
 
             except Exception as e:
@@ -129,7 +127,7 @@ class StrategyManager:
             await asyncio.sleep(0.5)
 
     async def _send_status_report(self):
-        """현재 시황 보고."""
+        """현재 시황 및 포지션 상세 보고."""
         try:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
@@ -142,6 +140,7 @@ class StrategyManager:
                 status = f"보유중 (PnL: {(ticker['last']-pos['entry_price'])/pos['entry_price']*100:.2f}%)" if pos else "신호 감시 중"
                 msg += f"- {symbol}: {ticker['last']:,.0f}원 | {status}\n"
             await self.notifier.send_message(msg)
+            logger.info("✅ 텔레그램 보고서 전송 완료")
         except Exception as e:
             logger.error(f"보고 실패: {e}")
 
