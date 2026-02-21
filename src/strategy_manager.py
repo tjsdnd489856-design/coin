@@ -39,6 +39,7 @@ class StrategyManager:
         
         self.last_indicator_update = None
         self.last_heartbeat_time = None
+        self.last_daily_report_date = None # 일일 보고 추적용
         self.is_market_safe = True
 
     async def _check_market_sentiment(self):
@@ -104,6 +105,12 @@ class StrategyManager:
                     logger.info(f"💓 [정상 가동 중] 시장안전: {self.is_market_safe} | 코인: {', '.join(self.symbols)}")
                     self.last_heartbeat_time = now
 
+                # 3. 매일 오전 10시(KST) 자동 종합 보고 (UTC 01:00)
+                # 한국 시간 10시는 UTC 01시입니다.
+                if now.hour == 1 and self.last_daily_report_date != now.date():
+                    await self._send_status_report(is_daily_summary=True)
+                    self.last_daily_report_date = now.date()
+
                 await self._check_market_sentiment()
                 if self.last_indicator_update is None or (now - self.last_indicator_update).total_seconds() >= 60:
                     await self._update_all_indicators()
@@ -146,21 +153,32 @@ class StrategyManager:
                 await asyncio.sleep(2)
             await asyncio.sleep(0.5)
 
-    async def _send_status_report(self):
+    async def _send_status_report(self, is_daily_summary: bool = False):
         """현재 시황 및 포지션 상세 보고."""
         try:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
-            msg = "📊 [시스템 실시간 보고]\n"
+            
+            header = "📅 [일일 종합 보고]" if is_daily_summary else "📊 [시스템 실시간 보고]"
+            msg = f"{header}\n"
             msg += f"💰 원화 잔고: {krw_free:,.0f}원\n"
-            msg += f"🛡️ 시장 상태: {'안전' if self.is_market_safe else '위험(관망)'}\n\n"
+            msg += f"🛡️ 시장 상태: {'안전' if self.is_market_safe else '위험(관망)'}\n"
+            
+            if is_daily_summary:
+                # 최근 50회 평균 수익률 정보 추가
+                avg_pnl = sum(self.learner.recent_pnl) / len(self.learner.recent_pnl) if self.learner.recent_pnl else 0
+                msg += f"📈 최근 평균 수익률: {avg_pnl*100:.2f}%\n"
+                msg += f"🔄 최근 거래 횟수: {len(self.learner.recent_pnl)}회\n"
+
+            msg += "\n"
             for symbol in self.symbols:
                 ticker = await self.connector.fetch_ticker(symbol)
                 pos = self.coin_data[symbol]['position']
                 status = f"보유중 (PnL: {(ticker['last']-pos['entry_price'])/pos['entry_price']*100:.2f}%)" if pos else "신호 감시 중"
                 msg += f"- {symbol}: {ticker['last']:,.0f}원 | {status}\n"
+                
             await self.notifier.send_message(msg)
-            logger.info("✅ 텔레그램 보고서 전송 완료")
+            logger.info(f"✅ {'일일' if is_daily_summary else '실시간'} 보고서 전송 완료")
         except Exception as e:
             logger.error(f"보고 실패: {e}")
 
