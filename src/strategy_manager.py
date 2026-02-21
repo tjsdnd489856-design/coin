@@ -186,8 +186,20 @@ class StrategyManager:
         try:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
-            invest_krw = krw_free / (len(self.symbols) + 1)
-            if invest_krw < 5000: return
+            
+            # 현재 보유 중인 포지션 개수 계산
+            active_positions = sum(1 for s in self.symbols if self.coin_data[s]['position'] is not None)
+            # 남은 슬롯 개수 (전체 코인 수 - 현재 포지션 수)
+            remaining_slots = len(self.symbols) - active_positions
+            
+            if remaining_slots <= 0: return # 이미 모든 슬롯 점유 중
+            
+            # 남은 가용 원화를 남은 슬롯 수로 나누어 투자 (예산 전액 활용)
+            invest_krw = krw_free / remaining_slots
+            
+            # 최소 주문 금액(5,000원) 및 잔고 부족 체크 (여유분 0.1% 제외)
+            if invest_krw < 5050: return 
+            invest_krw = invest_krw * 0.999 # 수수료 등을 위한 미세 여유분
             
             strategy = self.coin_data[symbol]['strategies'][strategy_type]
             # 업비트 시장가 매수는 수량이 아닌 '투자 금액'을 amount 자리에 넣어야 함
