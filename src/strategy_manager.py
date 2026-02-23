@@ -11,7 +11,6 @@ from src.connector.exchange_base import ExchangeConnector
 from src.learner.online_learner import OnlineLearner
 from src.learner.schema import TradeEvent, ExecutionResult
 from src.strategy.scalping_strategy import ScalpingStrategy
-from src.strategy.reversal_strategy import ReversalStrategy
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.learner.utils import get_logger, now_utc
 
@@ -37,7 +36,6 @@ class StrategyManager:
             self.coin_data[symbol] = {
                 'strategies': {
                     'trend': ScalpingStrategy(),
-                    'reversal': ReversalStrategy()
                 },
                 'position': None,
             }
@@ -176,10 +174,9 @@ class StrategyManager:
                 ai_pred = await self.learner.predict(event)
                 pred_dict = ai_pred.model_dump()
 
+                # 초단타 스캘핑 전략만 확인
                 if await data['strategies']['trend'].check_signal(ticker, pred_dict):
                     await self._execute_buy(symbol, ticker, "trend")
-                elif await data['strategies']['reversal'].check_signal(ticker, pred_dict):
-                    await self._execute_buy(symbol, ticker, "reversal")
 
             # 보유 포지션이 있을 때 (매도 검토)
             else:
