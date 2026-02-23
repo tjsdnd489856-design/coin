@@ -28,7 +28,9 @@ class StrategyManager:
         self.is_running = False
         self.is_paused = False  # 일시 정지 상태 플래그
 
-        symbols_str = os.getenv("SYMBOL_LIST", "BTC/KRW,ETH/KRW,XRP/KRW")
+        # 기본 감시 코인을 10개로 확장 (업비트 거래대금 상위 및 메이저 코인)
+        default_symbols = "BTC/KRW,ETH/KRW,XRP/KRW,SOL/KRW,DOGE/KRW,ADA/KRW,TRX/KRW,AVAX/KRW,DOT/KRW,LINK/KRW"
+        symbols_str = os.getenv("SYMBOL_LIST", default_symbols)
         self.symbols = [s.strip() for s in symbols_str.split(",")]
 
         self.coin_data = {}
@@ -70,14 +72,15 @@ class StrategyManager:
 
     async def _update_all_indicators(self):
         """모든 코인의 기술적 지표 업데이트."""
-        logger.info("📡 지표 및 AI 모델 데이터 동기화 중...")
+        logger.info(f"📡 {len(self.symbols)}개 코인 지표 및 AI 모델 데이터 동기화 중...")
         for symbol in self.symbols:
             try:
                 ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=50)
                 if ohlcv and len(ohlcv) >= 30:
                     for strategy in self.coin_data[symbol]['strategies'].values():
                         await strategy.update_indicators(ohlcv)
-                await asyncio.sleep(0.1)
+                # 코인이 늘어났으므로 API 과부하 방지를 위해 짧은 대기 추가
+                await asyncio.sleep(0.05)
             except Exception as e:
                 logger.error(f"[{symbol}] 지표 업데이트 실패: {e}")
         self.last_indicator_update = now_utc()
@@ -104,7 +107,8 @@ class StrategyManager:
     async def start(self):
         """메인 실행 루프."""
         self.is_running = True
-        await self.notifier.send_message("💎 AI 지능형 매매 시스템 가동\n(명령어: 시작, 종료, 보고)")
+        symbols_list_str = ", ".join([s.split('/')[0] for s in self.symbols])
+        await self.notifier.send_message(f"💎 AI 지능형 매매 시스템 가동\n대상: {symbols_list_str}\n(명령어: 시작, 종료, 보고)")
         await self._update_all_indicators()
 
         while self.is_running:
@@ -116,7 +120,6 @@ class StrategyManager:
 
                 # 2. 일시 정지 상태라면 매매 로직 건너뛰기
                 if self.is_paused:
-                    # 정지 상태임을 알리는 로그는 너무 자주 찍지 않도록 함
                     if now.second % 60 == 0: 
                         logger.info("💤 시스템 일시 정지 대기 중...")
                     await asyncio.sleep(1)
@@ -159,7 +162,6 @@ class StrategyManager:
 
             # 보유 포지션이 없을 때 (매수 검토)
             if not data['position']:
-                # 시장이 위험하거나 건전하지 않으면 매수 금지
                 if not self.is_market_safe:
                     return
                 
@@ -174,7 +176,6 @@ class StrategyManager:
                 ai_pred = await self.learner.predict(event)
                 pred_dict = ai_pred.model_dump()
 
-                # 초단타 스캘핑 전략만 확인
                 if await data['strategies']['trend'].check_signal(ticker, pred_dict):
                     await self._execute_buy(symbol, ticker, "trend")
 
@@ -197,7 +198,6 @@ class StrategyManager:
             pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
             await self.notifier.send_message(f"💰 [매도 완료] {symbol}\n수익률: {pnl:.2f}% ({exit_type})")
             
-            # AI 학습 피드백
             await self.learner.feedback(ExecutionResult(
                 order_id=order.get('id', 'unknown'), 
                 filled_price=ticker['last'], 
@@ -239,7 +239,6 @@ class StrategyManager:
                 msg += "(보유 중인 코인 없음)"
 
             await self.notifier.send_message(msg)
-            logger.info("보고서 전송 완료")
         except Exception as e:
             logger.error(f"보고 실패: {e}")
 
