@@ -19,11 +19,15 @@ class ScalpingStrategy(BaseStrategy):
     """초단타 하이퍼 스캘핑 전략 (실시간 가격 추적 및 본전 보존 기능 포함)."""
 
     def __init__(self):
-        # [핵심 설정]
+        # [핵심 설정] - 기본값 (AI가 동적으로 변경 가능)
         self.take_profit_pct = 0.004    # 추격 시작 수익률 (0.4%)
         self.trailing_callback = 0.0015 # 최고점 대비 하락 시 매도 (0.15%)
         self.stop_loss_pct = 0.003      # 손절 0.3%
         self.fee_rate = 0.0005          # 업비트 수수료 0.05%
+        
+        # [AI 제안 적용 대상]
+        self.rsi_lower_bound = 45       # RSI 매수 하한선
+        self.volume_threshold = 1.2     # 거래량 급증 기준
         
         # 지표 데이터
         self.rsi = None
@@ -73,15 +77,26 @@ class ScalpingStrategy(BaseStrategy):
         self.volume_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
 
     async def check_signal(self, current_data: Dict[str, Any], ai_pred: Dict[str, Any] = None) -> bool:
-        """매수 신호 감지."""
+        """매수 신호 감지 (AI 제안 파라미터 적용)."""
         if self.rsi is None:
             return False
+            
+        # AI 제안 파라미터 적용 로직
+        if ai_pred and 'suggested_params' in ai_pred:
+            params = ai_pred['suggested_params']
+            # AI가 제안한 값으로 전략 변수 업데이트
+            self.stop_loss_pct = params.get('stop_loss_pct', self.stop_loss_pct)
+            self.take_profit_pct = params.get('take_profit_pct', self.take_profit_pct)
+            self.rsi_lower_bound = params.get('rsi_buy_threshold', self.rsi_lower_bound)
+            self.volume_threshold = params.get('volume_multiplier', self.volume_threshold)
             
         current_price = current_data['last']
         
         cond_trend = self.ma_5 > self.ma_20
-        cond_rsi = 45 < self.rsi < 65
-        cond_vol = self.volume_ratio > 1.2
+        # AI가 조정한 RSI 기준 사용
+        cond_rsi = self.rsi_lower_bound < self.rsi < 65
+        # AI가 조정한 거래량 기준 사용
+        cond_vol = self.volume_ratio > self.volume_threshold
         cond_room = current_price < self.bb_upper
 
         if cond_trend and cond_rsi and cond_vol and cond_room:
@@ -93,7 +108,7 @@ class ScalpingStrategy(BaseStrategy):
             self.reset_trailing_state()
             self.max_price = current_price
             
-            logger.info(f"⚡ 스캘핑 진입 신호 포착! RSI:{self.rsi:.1f}, Vol:{self.volume_ratio:.1f}배")
+            logger.info(f"⚡ [AI 진입] RSI:{self.rsi:.1f}(>{self.rsi_lower_bound}), Vol:{self.volume_ratio:.1f}배(>{self.volume_threshold})")
             return True
             
         return False
