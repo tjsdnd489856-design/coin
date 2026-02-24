@@ -21,7 +21,7 @@ class ExchangeConnector:
         self.is_dry_run = os.getenv("DRY_RUN", "True").lower() == "true"
         
         self.exchange = self._init_exchange()
-        logger.info(f"🔌 {self.exchange_id.upper()} 거래소 연결 초기화 완료 (Dry Run: {self.is_dry_run})")
+        logger.info(f"🔌 {self.exchange_id.upper()} 연결 완료 (테스트모드: {self.is_dry_run})")
 
     def _init_exchange(self) -> Any:
         """거래소 객체 생성 및 설정."""
@@ -30,87 +30,81 @@ class ExchangeConnector:
             
         exchange_class = getattr(ccxt, self.exchange_id)
         
-        # 공통 옵션 설정
         options = {
             'apiKey': self.api_key,
             'secret': self.secret_key,
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'spot', # 현물 거래 기본
+                'defaultType': 'spot',
             }
         }
 
-        # 거래소별 특화 설정
         if self.exchange_id == 'upbit':
-            # 업비트: 시장가 매수 시 가격 파라미터 필요 없음 설정
             options['options']['createMarketBuyOrderRequiresPrice'] = False
             
-        elif self.exchange_id in ['htx', 'huobi']:
-            # HTX (구 Huobi): 시장가 주문 시 수량 정밀도 조정 등 필요시 추가
-            options['options']['createMarketBuyOrderRequiresPrice'] = False
-
         return exchange_class(options)
 
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         """현재가 및 시세 정보 조회."""
         try:
-            ticker = await self.exchange.fetch_ticker(symbol)
-            return ticker
+            return await self.exchange.fetch_ticker(symbol)
         except Exception as e:
-            logger.error(f"[{self.exchange_id}] 시세 조회 에러: {e}")
+            logger.error(f"시세 조회 에러 ({symbol}): {e}")
             return {}
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1d', limit: int = 2) -> List[List[Any]]:
         """과거 캔들 데이터 조회."""
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            return ohlcv
+            return await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
-            logger.error(f"[{self.exchange_id}] OHLCV 데이터 조회 에러: {e}")
+            logger.error(f"데이터 조회 에러 ({symbol}): {e}")
             return []
 
     async def fetch_balance(self) -> Dict[str, Any]:
-        """계좌 잔고 조회 (KRW 또는 USDT 기준)."""
+        """계좌 잔고 조회."""
         if self.is_dry_run:
-            # 테스트 모드: 가상 자산 (업비트=KRW, 글로벌=USDT)
             currency = "KRW" if self.exchange_id == 'upbit' else "USDT"
-            return {"free": {currency: 10000.0}, "total": {currency: 10000.0}}
+            return {"free": {currency: 1000000.0}, "total": {currency: 1000000.0}}
             
         try:
-            balance = await self.exchange.fetch_balance()
-            return balance
+            # 시장 데이터(마켓 정보)가 로드되어야 잔고 계산이 정확함
+            if not self.exchange.markets:
+                await self.exchange.load_markets()
+            return await self.exchange.fetch_balance()
         except Exception as e:
-            logger.error(f"[{self.exchange_id}] 잔고 조회 에러: {e}")
+            logger.error(f"잔고 조회 에러: {e}")
             return {}
 
     async def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None) -> Dict[str, Any]:
-        """주문 실행 (시장가/지정가)."""
+        """주문 실행 (업비트 특화 로직 포함)."""
         if self.is_dry_run:
-            logger.info(f"[DRY_RUN] 주문 시뮬레이션 ({self.exchange_id}): {side} {amount} {symbol}")
-            return {"id": "dry_run_id", "status": "closed", "price": price or 1.0}
+            logger.info(f"[시뮬레이션] {symbol} {side} {amount:,.2f}")
+            return {"id": "dry_run", "status": "closed"}
 
         try:
-            if price:
-                # 지정가 주문
-                order = await self.exchange.create_limit_order(symbol, side, amount, price)
-            else:
-                # 시장가 주문
-                # 주의: 업비트 매수(buy)는 amount가 '주문 총액(Cost)'이고, 
-                #       HTX 매수(buy)는 amount가 '매수 수량(Quantity)'일 수 있음.
-                #       ccxt가 대부분 처리해주지만, 거래소별 특성을 고려해야 함.
-                if self.exchange_id == 'upbit' and side == 'buy':
-                    # 업비트 시장가 매수는 cost(비용) 기준
-                    order = await self.exchange.create_order(symbol, 'market', side, amount, price) # create_market_buy_order_with_cost 권장되나 ccxt 버전에 따라 다름
+            # 마켓 정보 로드 (정밀도 계산용)
+            if not self.exchange.markets:
+                await self.exchange.load_markets()
+
+            if side == 'buy':
+                if self.exchange_id == 'upbit':
+                    # 업비트 시장가 매수는 '총 금액'을 입력해야 함
+                    # amount 인자가 KRW 금액으로 들어온다고 가정
+                    return await self.exchange.create_order(symbol, 'market', 'buy', amount)
                 else:
-                    # 일반적인 시장가 주문 (수량 기준)
-                    order = await self.exchange.create_market_order(symbol, side, amount)
-            
-            logger.info(f"주문 접수 성공: {order['id']}")
-            return order
+                    return await self.exchange.create_market_buy_order(symbol, amount)
+            else:
+                # 매도는 '수량' 기준 (정밀도 조절 필수)
+                amount = self.exchange.amount_to_precision(symbol, amount)
+                return await self.exchange.create_market_sell_order(symbol, amount)
+                
         except Exception as e:
-            logger.error(f"[{self.exchange_id}] 주문 에러: {e}")
+            logger.error(f"주문 실행 에러 ({symbol} {side}): {e}")
             return {}
 
     async def close(self):
-        """연결 종료."""
-        await self.exchange.close()
+        """연결 종료 및 리소스 해제."""
+        try:
+            await self.exchange.close()
+        except:
+            pass

@@ -1,11 +1,11 @@
 """
 멀티 코인 및 멀티 전략 관리자.
-텔레그램 명령어를 통해 시스템 일시 정지(종료) 및 재개(시작) 기능을 지원합니다.
+보유 코인 실시간 추적 및 초고속 매도 대응 기능이 강화되었습니다.
 """
 import asyncio
 import os
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List
 from src.connector.exchange_base import ExchangeConnector
 from src.learner.online_learner import OnlineLearner
@@ -26,14 +26,12 @@ class StrategyManager:
         self.learner = OnlineLearner()
         self.notifier = TelegramNotifier()
         self.is_running = False
-        self.is_paused = False  # 일시 정지 상태 플래그
+        self.is_paused = False
 
-        # 감시 코인은 10개를 유지하되, 투자는 최대 5개 코인에 집중 (5분할)
         default_symbols = "BTC/KRW,ETH/KRW,XRP/KRW,SOL/KRW,DOGE/KRW,ADA/KRW,TRX/KRW,AVAX/KRW,DOT/KRW,LINK/KRW"
         symbols_str = os.getenv("SYMBOL_LIST", default_symbols)
         self.symbols = [s.strip() for s in symbols_str.split(",")]
         
-        # 투자 비중 설정 (5등분)
         self.max_positions = 5
 
         self.coin_data = {}
@@ -43,6 +41,7 @@ class StrategyManager:
                     'trend': ScalpingStrategy(),
                 },
                 'position': None,
+                'last_sell_time': None, # 재진입 방지용
             }
 
         self.last_indicator_update = None
@@ -75,7 +74,6 @@ class StrategyManager:
 
     async def _update_all_indicators(self):
         """모든 코인의 기술적 지표 업데이트."""
-        logger.info(f"📡 {len(self.symbols)}개 코인 지표 동기화 중...")
         for symbol in self.symbols:
             try:
                 ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=50)
@@ -90,28 +88,68 @@ class StrategyManager:
     async def _process_commands(self):
         """텔레그램 명령어 처리 로직."""
         cmd = await self.notifier.get_recent_command()
-        if not cmd:
-            return
+        if not cmd: return
 
         if "종료" in cmd:
             self.is_paused = True
             await self.notifier.send_message("⏸️ 시스템을 **일시 정지**합니다.")
-            logger.info("사용자 명령에 의해 시스템 일시 정지")
-
         elif "시작" in cmd:
             self.is_paused = False
             await self.notifier.send_message("▶️ 시스템을 **재개**합니다.")
-            logger.info("사용자 명령에 의해 시스템 재개")
-
         elif "보고" in cmd:
             await self._send_status_report()
+
+    async def _monitor_positions_loop(self):
+        """보유 중인 코인의 가격을 1초마다 실시간으로 추적하고 매도 신호에 반응합니다."""
+        logger.info("👀 [실시간 감시] 포지션 추적 루프 가동")
+        while self.is_running:
+            try:
+                if self.is_paused:
+                    await asyncio.sleep(1)
+                    continue
+
+                tasks = []
+                for symbol in self.symbols:
+                    pos = self.coin_data[symbol]['position']
+                    # 포지션이 있고, 현재 매도 진행 중이 아닌 경우에만 감시
+                    if pos and pos.get('state') != 'selling':
+                        tasks.append(self._check_position_exit(symbol, pos))
+                
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+            except Exception as e:
+                logger.error(f"실시간 감시 루프 오류: {e}")
+            
+            await asyncio.sleep(1)
+
+    async def _check_position_exit(self, symbol: str, pos: Dict[str, Any]):
+        """개별 포지션의 탈출 조건을 실시간으로 확인."""
+        try:
+            ticker = await self.connector.fetch_ticker(symbol)
+            if not ticker: return
+
+            strategy = self.coin_data[symbol]['strategies'][pos['strategy_type']]
+            exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'])
+            
+            if exit_type:
+                # 즉시 상태를 매도 중으로 변경하여 중복 체크 방지
+                pos['state'] = 'selling'
+                await self._execute_sell(symbol, ticker, pos, exit_type)
+        except Exception as e:
+            logger.error(f"[{symbol}] 실시간 가격 체크 오류: {e}")
 
     async def start(self):
         """메인 실행 루프."""
         self.is_running = True
         symbols_list_str = ", ".join([s.split('/')[0] for s in self.symbols])
-        await self.notifier.send_message(f"💎 AI 매매 시스템 가동 (5분할 집중 투자)\n대상: {symbols_list_str}")
+        await self.notifier.send_message(f"💎 AI 매매 시스템 가동 (실시간 추적 강화)\n대상: {symbols_list_str}")
+        
+        # 1. 지표 초기 업데이트
         await self._update_all_indicators()
+
+        # 2. 실시간 감시 루프를 배경 작업으로 실행
+        asyncio.create_task(self._monitor_positions_loop())
 
         while self.is_running:
             try:
@@ -119,10 +157,10 @@ class StrategyManager:
                 await self._process_commands()
 
                 if self.is_paused:
-                    if now.second % 60 == 0: logger.info("💤 일시 정지 중...")
                     await asyncio.sleep(1)
                     continue
 
+                # 하트비트 및 일일 보고
                 if self.last_heartbeat_time is None or (now - self.last_heartbeat_time).total_seconds() >= 3600:
                     logger.info(f"💓 [정상 가동] 시장: {'안전' if self.is_market_safe else '주의'}")
                     self.last_heartbeat_time = now
@@ -131,11 +169,13 @@ class StrategyManager:
                     await self._send_status_report(is_daily_summary=True)
                     self.last_daily_report_date = now.date()
 
+                # 시장 상황 분석 및 지표 업데이트
                 await self._check_market_sentiment()
                 
                 if self.last_indicator_update is None or (now - self.last_indicator_update).total_seconds() >= 60:
                     await self._update_all_indicators()
 
+                # 매수 신호 탐색 루프 (매도는 _monitor_positions_loop에서 처리)
                 for symbol in self.symbols:
                     await self._process_trading_logic(symbol, now)
                     await asyncio.sleep(0.05)
@@ -147,69 +187,103 @@ class StrategyManager:
             await asyncio.sleep(0.5)
 
     async def _process_trading_logic(self, symbol: str, now: datetime):
-        """개별 코인에 대한 매수/매도 판단 로직."""
+        """매수 신호를 탐색하는 로직."""
         try:
             data = self.coin_data[symbol]
+            # 이미 포지션이 있으면 스킵
+            if data['position']: return
+
+            # 재매수 쿨타임 체크 (매도 후 5분간 금지)
+            if data['last_sell_time'] and (now - data['last_sell_time']).total_seconds() < 300:
+                return
+
+            if not self.is_market_safe: return
+
             ticker = await self.connector.fetch_ticker(symbol)
             if not ticker: return
 
-            # 보유 포지션이 없을 때 (매수 검토)
-            if not data['position']:
-                if not self.is_market_safe: return
-                
-                event = TradeEvent(
-                    trace_id=f"t_{int(now.timestamp())}", 
-                    exchange=self.connector.exchange_id, 
-                    symbol=symbol, 
-                    side="buy", 
-                    price=ticker['last'], 
-                    quantity=0
-                )
-                ai_pred = await self.learner.predict(event)
-                pred_dict = ai_pred.model_dump()
-
-                if await data['strategies']['trend'].check_signal(ticker, pred_dict):
-                    await self._execute_buy(symbol, ticker, "trend")
-
-            # 보유 포지션이 있을 때 (매도 검토)
-            else:
-                pos = data['position']
-                strategy = data['strategies'][pos['strategy_type']]
-                exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'])
-                
-                if exit_type:
-                    await self._execute_sell(symbol, ticker, pos, exit_type)
+            # AI 예측 및 전략 신호 확인
+            event = TradeEvent(
+                trace_id=f"t_{int(now.timestamp())}", exchange=self.connector.exchange_id, 
+                symbol=symbol, side="buy", price=ticker['last'], quantity=0
+            )
+            ai_pred = await self.learner.predict(event)
+            
+            if await data['strategies']['trend'].check_signal(ticker, ai_pred.model_dump()):
+                await self._execute_buy(symbol, ticker, "trend")
 
         except Exception as e:
-            logger.error(f"[{symbol}] 트레이딩 로직 오류: {e}")
+            logger.error(f"[{symbol}] 매수 탐색 오류: {e}")
 
     async def _execute_sell(self, symbol: str, ticker: Dict[str, Any], pos: Dict[str, Any], exit_type: str):
         """매도 실행 및 결과 처리."""
-        order = await self.connector.create_order(symbol, "sell", pos['amount'])
-        if order:
-            pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
-            await self.notifier.send_message(f"💰 [매도] {symbol} ({pnl:.2f}%, {exit_type})")
+        try:
+            balance = await self.connector.fetch_balance()
+            coin_code = symbol.split('/')[0]
+            actual_amount = balance.get('free', {}).get(coin_code, 0)
             
-            await self.learner.feedback(ExecutionResult(
-                order_id=order.get('id', 'unknown'), 
-                filled_price=ticker['last'], 
-                pnl_pct=pnl/100.0, 
-                strategy_type=pos['strategy_type']
-            ))
-            self.coin_data[symbol]['position'] = None
+            if actual_amount <= 0:
+                self.coin_data[symbol]['position'] = None
+                return
+
+            if actual_amount * ticker['last'] < 5050:
+                self.coin_data[symbol]['position'] = None
+                return
+
+            order = await self.connector.create_order(symbol, "sell", actual_amount)
+            if order:
+                pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
+                await self.notifier.send_message(f"💰 [매도] {symbol} ({pnl:.2f}%, {exit_type})")
+                
+                # 상태 관리: 쿨타임 및 포지션 초기화
+                self.coin_data[symbol]['strategies'][pos['strategy_type']].reset_trailing_state()
+                self.coin_data[symbol]['last_sell_time'] = now_utc()
+                self.coin_data[symbol]['position'] = None
+                
+                await self.learner.feedback(ExecutionResult(
+                    order_id=order.get('id', 'unknown'), 
+                    filled_price=ticker['last'], pnl_pct=pnl/100.0, strategy_type=pos['strategy_type']
+                ))
+        except Exception as e:
+            logger.error(f"[{symbol}] 매도 실행 실패: {e}")
+            # 실패 시 다시 감시할 수 있도록 상태 복구
+            if self.coin_data[symbol]['position']:
+                self.coin_data[symbol]['position']['state'] = 'active'
+
+    async def _execute_buy(self, symbol: str, ticker: Dict[str, Any], strategy_type: str):
+        """매수 실행."""
+        try:
+            active_positions = sum(1 for s in self.symbols if self.coin_data[s]['position'] is not None)
+            if active_positions >= self.max_positions: return
+            
+            balance = await self.connector.fetch_balance()
+            krw_free = balance.get('free', {}).get('KRW', 0)
+            
+            remaining_slots = self.max_positions - active_positions
+            invest_krw = (krw_free / remaining_slots) * 0.98 # 소폭 여유를 둠
+            
+            if invest_krw < 5050: return 
+            
+            order = await self.connector.create_order(symbol, "buy", invest_krw)
+            if order:
+                self.coin_data[symbol]['position'] = {
+                    'entry_price': ticker['last'], 
+                    'strategy_type': strategy_type,
+                    'state': 'active'
+                }
+                await self.notifier.send_message(f"🚀 [매수] {symbol} (진입가: {ticker['last']:,.0f})")
+        except Exception as e:
+            logger.error(f"[{symbol}] 매수 실패: {e}")
 
     async def _send_status_report(self, is_daily_summary: bool = False):
         """상태 보고서 전송."""
         try:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
-            
             header = "📅 [일일 보고]" if is_daily_summary else "📊 [상태 보고]"
-            status_text = "일시 정지 ⏸️" if self.is_paused else "가동 중 ▶️"
+            msg = f"{header}\n💰 잔고: {krw_free:,.0f}원\n🛡️ 시장: {'안전' if self.is_market_safe else '주의'}\n"
             
-            msg = f"{header}\n상태: {status_text}\n💰 잔고: {krw_free:,.0f}원\n🛡️ 시장: {'안전' if self.is_market_safe else '주의'}\n"
-            
-            msg += "\n[보유 코인]\n"
+            msg += "\n[실시간 수익 현황]\n"
             active_count = 0
             for symbol in self.symbols:
                 pos = self.coin_data[symbol]['position']
@@ -218,47 +292,10 @@ class StrategyManager:
                     ticker = await self.connector.fetch_ticker(symbol)
                     pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
                     msg += f"- {symbol}: {pnl:+.2f}%\n"
-            
-            if active_count == 0: msg += "(없음)"
-            msg += f"\n(슬롯: {active_count}/{self.max_positions})"
-
+            if active_count == 0: msg += "(보유 코인 없음)"
             await self.notifier.send_message(msg)
         except Exception as e:
             logger.error(f"보고 실패: {e}")
-
-    async def _execute_buy(self, symbol: str, ticker: Dict[str, Any], strategy_type: str):
-        """매수 실행 (5분할 투자)."""
-        try:
-            # 현재 몇 개의 코인을 가지고 있는지 확인
-            active_positions = sum(1 for s in self.symbols if self.coin_data[s]['position'] is not None)
-            
-            # 이미 5개 코인을 보유 중이면 더 이상 사지 않음
-            if active_positions >= self.max_positions:
-                return
-            
-            balance = await self.connector.fetch_balance()
-            krw_free = balance.get('free', {}).get('KRW', 0)
-            
-            # 한 번 투자할 때 가용한 전체 원금의 1/5 수준으로 투자
-            # (남은 현금 / 남은 슬롯) 방식으로 계산하여 자금을 효율적으로 배분
-            remaining_slots = self.max_positions - active_positions
-            invest_krw = (krw_free / remaining_slots) * 0.99
-            
-            if invest_krw < 5050: return 
-            
-            strategy = self.coin_data[symbol]['strategies'][strategy_type]
-            order = await self.connector.create_order(symbol, "buy", invest_krw)
-            
-            if order:
-                amount = strategy.calculate_amount(invest_krw, ticker['last'])
-                self.coin_data[symbol]['position'] = {
-                    'entry_price': ticker['last'], 
-                    'amount': amount, 
-                    'strategy_type': strategy_type
-                }
-                await self.notifier.send_message(f"🚀 [매수] {symbol} (비중 1/{self.max_positions})")
-        except Exception as e:
-            logger.error(f"[{symbol}] 매수 실패: {e}")
 
     def stop(self):
         self.is_running = False
