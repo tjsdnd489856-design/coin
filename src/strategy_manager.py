@@ -80,7 +80,7 @@ class StrategyManager:
                 if ohlcv and len(ohlcv) >= 30:
                     for strategy in self.coin_data[symbol]['strategies'].values():
                         await strategy.update_indicators(ohlcv)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.2)
             except Exception as e:
                 logger.error(f"[{symbol}] 지표 업데이트 실패: {e}")
         self.last_indicator_update = now_utc()
@@ -108,15 +108,13 @@ class StrategyManager:
                     await asyncio.sleep(1)
                     continue
 
-                tasks = []
+                # Upbit 429 에러 방지를 위해 순차 실행 및 지연 추가
                 for symbol in self.symbols:
                     pos = self.coin_data[symbol]['position']
                     # 포지션이 있고, 현재 매도 진행 중이 아닌 경우에만 감시
                     if pos and pos.get('state') != 'selling':
-                        tasks.append(self._check_position_exit(symbol, pos))
-                
-                if tasks:
-                    await asyncio.gather(*tasks)
+                        await self._check_position_exit(symbol, pos)
+                        await asyncio.sleep(0.2)
 
             except Exception as e:
                 logger.error(f"실시간 감시 루프 오류: {e}")
@@ -178,7 +176,7 @@ class StrategyManager:
                 # 매수 신호 탐색 루프 (매도는 _monitor_positions_loop에서 처리)
                 for symbol in self.symbols:
                     await self._process_trading_logic(symbol, now)
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.2)
 
             except Exception as e:
                 logger.error(f"메인 루프 오류: {e}")
