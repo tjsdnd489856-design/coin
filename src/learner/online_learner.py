@@ -31,7 +31,7 @@ class OnlineLearner:
         self.current_params = TradeParams(
             k=0.5, 
             rsi_buy_threshold=30,
-            stop_loss_pct=0.01,
+            stop_loss_pct=0.005,
             take_profit_pct=0.015,
             volume_multiplier=1.3
         )
