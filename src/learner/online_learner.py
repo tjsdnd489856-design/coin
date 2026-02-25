@@ -30,10 +30,10 @@ class OnlineLearner:
         # 현재 적용 중인 기본 파라미터 (초기값)
         self.current_params = TradeParams(
             k=0.5, 
-            rsi_buy_threshold=25,
-            stop_loss_pct=0.005,
-            take_profit_pct=0.012,
-            volume_multiplier=2.0
+            rsi_buy_threshold=30,
+            stop_loss_pct=0.01,
+            take_profit_pct=0.015,
+            volume_multiplier=1.3
         )
         
         # 백그라운드 학습 루프 시작
@@ -73,16 +73,16 @@ class OnlineLearner:
 
         # [튜닝 로직 1] 기대값이 음수이거나 손익비가 1.0 미만 (손실 구간)
         if expected_value < 0 or profit_factor < 1.1:
-            logger.info(f"📉 성과 저조 (EV: {expected_value:.4f}, PF: {profit_factor:.2f}). 보수적 설정 적용.")
+            logger.debug(f"📉 성과 저조 (EV: {expected_value:.4f}, PF: {profit_factor:.2f}). 보수적 설정 적용.")
             new_params.k = min(0.85, new_params.k + 0.05)
-            new_params.rsi_buy_threshold = max(20, new_params.rsi_buy_threshold - 3)
-            new_params.volume_multiplier = min(3.5, new_params.volume_multiplier + 0.3)
+            new_params.rsi_buy_threshold = max(20, new_params.rsi_buy_threshold - 2)
+            new_params.volume_multiplier = min(1.8, new_params.volume_multiplier + 0.1)
             # 손절은 더 짧게, 익절은 더 길게 (손익비 개선 시도)
             new_params.stop_loss_pct = max(0.005, new_params.stop_loss_pct - 0.001)
             
         # [튜닝 로직 2] 성과 우수 (손익비 1.5 이상, 기대값 양수)
         elif profit_factor > 1.5 and expected_value > 0.002:
-            logger.info(f"📈 성과 우수 (PF: {profit_factor:.2f}). 기회 확대.")
+            logger.debug(f"📈 성과 우수 (PF: {profit_factor:.2f}). 기회 확대.")
             new_params.k = max(0.35, new_params.k - 0.03)
             new_params.rsi_buy_threshold = min(35, new_params.rsi_buy_threshold + 2)
             new_params.volume_multiplier = max(1.5, new_params.volume_multiplier - 0.2)
