@@ -27,13 +27,13 @@ class OnlineLearner:
         # [핵심] 최근 50회 거래 성과 메모리 (단기 기억)
         self.recent_pnl: Deque[float] = deque(maxlen=50)
         
-        # 현재 적용 중인 기본 파라미터 (초기값)
+        # 현재 적용 중인 기본 파라미터 (초기값) - 거래 빈도를 높이기 위해 조건 완화
         self.current_params = TradeParams(
             k=0.5, 
-            rsi_buy_threshold=30,
+            rsi_buy_threshold=40,    # 30에서 40으로 상향 (조금 더 쉽게 진입)
             stop_loss_pct=0.005,
             take_profit_pct=0.015,
-            volume_multiplier=1.3
+            volume_multiplier=0.8    # 1.3에서 0.8로 하향 (거래량 급증이 없어도 진입 가능)
         )
         
         # 백그라운드 학습 루프 시작
@@ -41,16 +41,12 @@ class OnlineLearner:
 
     async def predict(self, event: TradeEvent) -> Prediction:
         """현재 시장 상황과 과거 성과를 반영한 최적 파라미터 제안."""
-        # 1. 피처 계산 (생략 가능하나 확장성 위해 유지)
-        # features = await self.feature_store.compute_features(event)
-        
-        # 2. 적응형 파라미터 계산 (Adaptive Logic)
         adjusted_params = self._adjust_params_based_on_performance()
         
         return Prediction(
             model_version="adaptive_v1",
             suggested_params=adjusted_params,
-            estimated_slippage=0.001, # 고정값 또는 예측값
+            estimated_slippage=0.001,
             confidence_score=self._calculate_confidence()
         )
 
@@ -77,15 +73,14 @@ class OnlineLearner:
             new_params.k = min(0.85, new_params.k + 0.05)
             new_params.rsi_buy_threshold = max(20, new_params.rsi_buy_threshold - 2)
             new_params.volume_multiplier = min(1.8, new_params.volume_multiplier + 0.1)
-            # 손절은 더 짧게, 익절은 더 길게 (손익비 개선 시도)
             new_params.stop_loss_pct = max(0.005, new_params.stop_loss_pct - 0.001)
             
         # [튜닝 로직 2] 성과 우수 (손익비 1.5 이상, 기대값 양수)
         elif profit_factor > 1.5 and expected_value > 0.002:
             logger.debug(f"📈 성과 우수 (PF: {profit_factor:.2f}). 기회 확대.")
             new_params.k = max(0.35, new_params.k - 0.03)
-            new_params.rsi_buy_threshold = min(35, new_params.rsi_buy_threshold + 2)
-            new_params.volume_multiplier = max(1.5, new_params.volume_multiplier - 0.2)
+            new_params.rsi_buy_threshold = min(45, new_params.rsi_buy_threshold + 2)
+            new_params.volume_multiplier = max(0.5, new_params.volume_multiplier - 0.1)
 
         return new_params
 
@@ -106,7 +101,6 @@ class OnlineLearner:
             try:
                 result = await self.update_queue.get()
                 
-                # 결과 기록 (학습)
                 pnl = result.pnl_pct
                 self.recent_pnl.append(pnl)
                 

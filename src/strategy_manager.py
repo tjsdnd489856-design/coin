@@ -108,10 +108,8 @@ class StrategyManager:
                     await asyncio.sleep(1)
                     continue
 
-                # Upbit 429 에러 방지를 위해 순차 실행 및 지연 추가
                 for symbol in self.symbols:
                     pos = self.coin_data[symbol]['position']
-                    # 포지션이 있고, 현재 매도 진행 중이 아닌 경우에만 감시
                     if pos and pos.get('state') != 'selling':
                         await self._check_position_exit(symbol, pos)
                         await asyncio.sleep(0.2)
@@ -131,7 +129,6 @@ class StrategyManager:
             exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'])
             
             if exit_type:
-                # 즉시 상태를 매도 중으로 변경하여 중복 체크 방지
                 pos['state'] = 'selling'
                 await self._execute_sell(symbol, ticker, pos, exit_type)
         except Exception as e:
@@ -143,10 +140,8 @@ class StrategyManager:
         symbols_list_str = ", ".join([s.split('/')[0] for s in self.symbols])
         await self.notifier.send_message(f"💎 AI 매매 시스템 가동 (실시간 추적 강화)\n대상: {symbols_list_str}")
         
-        # 1. 지표 초기 업데이트
         await self._update_all_indicators()
 
-        # 2. 실시간 감시 루프를 배경 작업으로 실행
         asyncio.create_task(self._monitor_positions_loop())
 
         while self.is_running:
@@ -158,7 +153,6 @@ class StrategyManager:
                     await asyncio.sleep(1)
                     continue
 
-                # 하트비트 및 일일 보고
                 if self.last_heartbeat_time is None or (now - self.last_heartbeat_time).total_seconds() >= 3600:
                     logger.info(f"💓 [정상 가동] 시장: {'안전' if self.is_market_safe else '주의'}")
                     self.last_heartbeat_time = now
@@ -167,13 +161,11 @@ class StrategyManager:
                     await self._send_status_report(is_daily_summary=True)
                     self.last_daily_report_date = now.date()
 
-                # 시장 상황 분석 및 지표 업데이트
                 await self._check_market_sentiment()
                 
                 if self.last_indicator_update is None or (now - self.last_indicator_update).total_seconds() >= 60:
                     await self._update_all_indicators()
 
-                # 매수 신호 탐색 루프 (매도는 _monitor_positions_loop에서 처리)
                 for symbol in self.symbols:
                     await self._process_trading_logic(symbol, now)
                     await asyncio.sleep(0.2)
@@ -188,10 +180,8 @@ class StrategyManager:
         """매수 신호를 탐색하는 로직."""
         try:
             data = self.coin_data[symbol]
-            # 이미 포지션이 있으면 스킵
             if data['position']: return
 
-            # 재매수 쿨타임 체크 (매도 후 5분간 금지)
             if data['last_sell_time'] and (now - data['last_sell_time']).total_seconds() < 300:
                 return
 
@@ -200,7 +190,6 @@ class StrategyManager:
             ticker = await self.connector.fetch_ticker(symbol)
             if not ticker: return
 
-            # AI 예측 및 전략 신호 확인
             event = TradeEvent(
                 trace_id=f"t_{int(now.timestamp())}", exchange=self.connector.exchange_id, 
                 symbol=symbol, side="buy", price=ticker['last'], quantity=0
@@ -218,13 +207,18 @@ class StrategyManager:
         try:
             balance = await self.connector.fetch_balance()
             coin_code = symbol.split('/')[0]
-            actual_amount = balance.get('free', {}).get(coin_code, 0)
+            
+            # 가상 모드일 때는 항상 수량이 있다고 가정 (테스트 버그 수정)
+            if self.connector.is_dry_run:
+                actual_amount = 1.0 
+            else:
+                actual_amount = balance.get('free', {}).get(coin_code, 0)
             
             if actual_amount <= 0:
                 self.coin_data[symbol]['position'] = None
                 return
 
-            if actual_amount * ticker['last'] < 5050:
+            if not self.connector.is_dry_run and actual_amount * ticker['last'] < 5050:
                 self.coin_data[symbol]['position'] = None
                 return
 
@@ -233,7 +227,6 @@ class StrategyManager:
                 pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
                 await self.notifier.send_message(f"💰 [매도] {symbol} ({pnl:.2f}%, {exit_type})")
                 
-                # 상태 관리: 쿨타임 및 포지션 초기화
                 self.coin_data[symbol]['strategies'][pos['strategy_type']].reset_trailing_state()
                 self.coin_data[symbol]['last_sell_time'] = now_utc()
                 self.coin_data[symbol]['position'] = None
@@ -244,7 +237,6 @@ class StrategyManager:
                 ))
         except Exception as e:
             logger.error(f"[{symbol}] 매도 실행 실패: {e}")
-            # 실패 시 다시 감시할 수 있도록 상태 복구
             if self.coin_data[symbol]['position']:
                 self.coin_data[symbol]['position']['state'] = 'active'
 
@@ -258,7 +250,7 @@ class StrategyManager:
             krw_free = balance.get('free', {}).get('KRW', 0)
             
             remaining_slots = self.max_positions - active_positions
-            invest_krw = (krw_free / remaining_slots) * 0.98 # 소폭 여유를 둠
+            invest_krw = (krw_free / remaining_slots) * 0.98
             
             if invest_krw < 5050: return 
             
