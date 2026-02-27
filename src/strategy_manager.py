@@ -1,6 +1,6 @@
 """
 멀티 코인 및 멀티 전략 관리자.
-보유 코인 실시간 추적 및 초고속 매도 대응 기능이 강화되었습니다.
+일간 2% 최대 손실 제한 및 5연패 중지 등 계좌 보호 기능이 추가되었습니다.
 """
 import asyncio
 import os
@@ -31,6 +31,13 @@ class StrategyManager:
         
         self.max_positions = 5
 
+        # [신규] 계좌 보호용 변수
+        self.daily_max_loss_pct = 0.02   # 하루 최대 손실 허용치 (2%)
+        self.max_consecutive_losses = 5  # 최대 연속 손실 횟수
+        self.start_of_day_balance = 0.0  # 오늘 하루 시작 잔고 (0시 기준)
+        self.current_consecutive_losses = 0 # 현재 연속 손실 횟수
+        self.daily_pnl_pct = 0.0         # 오늘 하루 누적 수익률
+
         self.coin_data = {}
         for symbol in self.symbols:
             self.coin_data[symbol] = {
@@ -45,6 +52,51 @@ class StrategyManager:
         self.last_heartbeat_time = None
         self.last_daily_report_date = None
         self.is_market_safe = True
+
+    async def _init_daily_balance(self):
+        """하루 시작 잔고를 기록 (일간 손실률 계산용)."""
+        balance = await self.connector.fetch_balance()
+        # 가용 잔고 + 묶인 잔고의 대략적인 합 (단순화를 위해 KRW 총액 사용)
+        total_krw = balance.get('total', {}).get('KRW', 0)
+        
+        # 만약 시작 잔고가 0이면 초기화, 날짜가 바뀌었을 때도 갱신 필요
+        if self.start_of_day_balance == 0 or total_krw > 0:
+            self.start_of_day_balance = total_krw
+            self.current_consecutive_losses = 0
+            self.daily_pnl_pct = 0.0
+            logger.info(f"🏦 일간 기준 잔고 초기화: {self.start_of_day_balance:,.0f}원")
+
+    async def _check_account_safety(self) -> bool:
+        """계좌가 터지는 것을 막는 일간 안전장치 확인."""
+        if self.start_of_day_balance <= 0:
+            return True
+
+        # 1. 5연패 확인
+        if self.current_consecutive_losses >= self.max_consecutive_losses:
+            if not self.is_paused:
+                self.is_paused = True
+                msg = f"🚨 **[긴급] 5회 연속 손실 발생!**\n안전을 위해 시스템을 강제 정지합니다.\n수동으로 확인 후 '/시작' 명령어를 내려주세요."
+                logger.error(msg)
+                await self.notifier.send_message(msg)
+            return False
+
+        # 2. 일간 최대 손실 2% 초과 확인
+        balance = await self.connector.fetch_balance()
+        current_total_krw = balance.get('total', {}).get('KRW', 0)
+        
+        # 현재 수익률 계산
+        if self.start_of_day_balance > 0:
+            self.daily_pnl_pct = (current_total_krw - self.start_of_day_balance) / self.start_of_day_balance
+            
+            if self.daily_pnl_pct <= -self.daily_max_loss_pct:
+                if not self.is_paused:
+                    self.is_paused = True
+                    msg = f"🚨 **[긴급] 일간 손실 한도(2%) 초과!**\n오늘 손실률: {self.daily_pnl_pct*100:.2f}%\n안전을 위해 시스템을 강제 정지합니다."
+                    logger.error(msg)
+                    await self.notifier.send_message(msg)
+                return False
+
+        return True
 
     async def _check_market_sentiment(self):
         """시장 건전성 및 추세 체크 (BTC 기준)."""
@@ -73,7 +125,9 @@ class StrategyManager:
         """모든 코인의 기술적 지표 업데이트."""
         for symbol in self.symbols:
             try:
-                ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=50)
+                # VWAP 등 계산을 위해 넉넉히 당일 치 데이터를 가져옵니다 (1m봉 1440개 = 24시간)
+                # 업비트는 보통 최대 200개 제한이므로 여러 번 땡기거나 가능한 만큼 가져옴 (여기선 200개)
+                ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=200)
                 if ohlcv and len(ohlcv) >= 30:
                     for strategy in self.coin_data[symbol]['strategies'].values():
                         await strategy.update_indicators(ohlcv)
@@ -92,7 +146,9 @@ class StrategyManager:
             await self.notifier.send_message("⏸️ 시스템을 **일시 정지**합니다.")
         elif "시작" in cmd:
             self.is_paused = False
-            await self.notifier.send_message("▶️ 시스템을 **재개**합니다.")
+            # 정지 후 재시작 시 연패 기록 등 초기화
+            self.current_consecutive_losses = 0
+            await self.notifier.send_message("▶️ 시스템을 **재개**합니다. (연패 기록 초기화)")
         elif "보고" in cmd:
             await self._send_status_report()
 
@@ -101,10 +157,7 @@ class StrategyManager:
         logger.info("👀 [실시간 감시] 포지션 추적 루프 가동")
         while self.is_running:
             try:
-                if self.is_paused:
-                    await asyncio.sleep(1)
-                    continue
-
+                # 포지션 추적은 시스템이 일시정지 상태여도(is_paused) 진행해야 물린 코인을 팔 수 있습니다.
                 for symbol in self.symbols:
                     pos = self.coin_data[symbol]['position']
                     if pos and pos.get('state') != 'selling':
@@ -123,7 +176,8 @@ class StrategyManager:
             if not ticker: return
 
             strategy = self.coin_data[symbol]['strategies'][pos['strategy_type']]
-            exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'])
+            # [신규] 진입 시간을 넘겨주어 10분 시간 제한을 체크할 수 있게 함
+            exit_type = strategy.check_exit_signal(pos['entry_price'], ticker['last'], pos.get('entry_time'))
             
             if exit_type:
                 pos['state'] = 'selling'
@@ -134,8 +188,11 @@ class StrategyManager:
     async def start(self):
         """메인 실행 루프."""
         self.is_running = True
+        
+        await self._init_daily_balance() # 시작 잔고 기록
+        
         symbols_list_str = ", ".join([s.split('/')[0] for s in self.symbols])
-        await self.notifier.send_message(f"💎 자동 매매 시스템 가동 (실시간 추적 강화)\n대상: {symbols_list_str}")
+        await self.notifier.send_message(f"🛡️ 안전강화 하이브리드 스캘핑 가동\n대상: {symbols_list_str}\n(안전장치: VWAP추세, 10분제한, 2%손실제한)")
         
         await self._update_all_indicators()
 
@@ -146,12 +203,19 @@ class StrategyManager:
                 now = now_utc()
                 await self._process_commands()
 
-                if self.is_paused:
+                # 자정이 넘어가면 일간 기준 잔고 초기화 (새로운 하루 시작)
+                if now.hour == 0 and now.minute == 0 and now.second < 10:
+                    await self._init_daily_balance()
+
+                # 일간 2% 손실, 5연패 체크 (매수 진입 차단용)
+                is_account_safe = await self._check_account_safety()
+
+                if self.is_paused or not is_account_safe:
                     await asyncio.sleep(1)
                     continue
 
                 if self.last_heartbeat_time is None or (now - self.last_heartbeat_time).total_seconds() >= 3600:
-                    logger.info(f"💓 [정상 가동] 시장: {'안전' if self.is_market_safe else '주의'}")
+                    logger.info(f"💓 [정상 가동] 시장: {'안전' if self.is_market_safe else '주의'} | 오늘수익률: {self.daily_pnl_pct*100:.2f}% | 연속손실: {self.current_consecutive_losses}회")
                     self.last_heartbeat_time = now
 
                 if now.hour == 1 and self.last_daily_report_date != now.date():
@@ -215,7 +279,15 @@ class StrategyManager:
             order = await self.connector.create_order(symbol, "sell", actual_amount)
             if order:
                 pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
-                await self.notifier.send_message(f"💰 [매도] {symbol} ({pnl:.2f}%, {exit_type})")
+                
+                # [신규] 연패 카운트 로직 적용 (수수료 포함 계산)
+                net_pnl = pnl - 0.1 # 대략적인 매수/매도 수수료(0.05*2) 제외
+                if net_pnl < 0:
+                    self.current_consecutive_losses += 1
+                else:
+                    self.current_consecutive_losses = 0 # 수익 발생 시 연패 초기화
+                    
+                await self.notifier.send_message(f"💰 [매도] {symbol} ({pnl:.2f}%, {exit_type})\n(현재 {self.current_consecutive_losses}연패 중)")
                 
                 self.coin_data[symbol]['strategies'][pos['strategy_type']].reset_trailing_state()
                 self.coin_data[symbol]['last_sell_time'] = now_utc()
@@ -245,7 +317,8 @@ class StrategyManager:
                 self.coin_data[symbol]['position'] = {
                     'entry_price': ticker['last'], 
                     'strategy_type': strategy_type,
-                    'state': 'active'
+                    'state': 'active',
+                    'entry_time': now_utc() # [신규] 진입 시간 기록 (10분 제한용)
                 }
                 await self.notifier.send_message(f"🚀 [매수] {symbol} (진입가: {ticker['last']:,.0f})")
         except Exception as e:
@@ -257,7 +330,8 @@ class StrategyManager:
             balance = await self.connector.fetch_balance()
             krw_free = balance.get('free', {}).get('KRW', 0)
             header = "📅 [일일 보고]" if is_daily_summary else "📊 [상태 보고]"
-            msg = f"{header}\n💰 잔고: {krw_free:,.0f}원\n🛡️ 시장: {'안전' if self.is_market_safe else '주의'}\n"
+            msg = f"{header}\n💰 가용 잔고: {krw_free:,.0f}원\n📉 오늘 수익률: {self.daily_pnl_pct*100:.2f}%\n"
+            msg += f"🛡️ 현재 연패: {self.current_consecutive_losses}회 / 최대 {self.max_consecutive_losses}회\n"
             
             msg += "\n[실시간 수익 현황]\n"
             active_count = 0
@@ -267,7 +341,10 @@ class StrategyManager:
                     active_count += 1
                     ticker = await self.connector.fetch_ticker(symbol)
                     pnl = (ticker['last'] - pos['entry_price']) / pos['entry_price'] * 100
-                    msg += f"- {symbol}: {pnl:+.2f}%\n"
+                    
+                    # 보유 시간 계산
+                    holding_mins = (now_utc() - pos['entry_time']).total_seconds() / 60
+                    msg += f"- {symbol}: {pnl:+.2f}% ({holding_mins:.1f}분 경과)\n"
             if active_count == 0: msg += "(보유 코인 없음)"
             await self.notifier.send_message(msg)
         except Exception as e:
