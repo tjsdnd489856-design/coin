@@ -1,6 +1,6 @@
 """
-[울티메이트 하이브리드 전략 - 브리핑 기능 강화]
-진입 및 관망 사유를 기록하여 보고서에 제공하는 기능이 추가되었습니다.
+[울티메이트 하이브리드 전략 - 브리핑 기능 세분화]
+지표 미준비 시 사유를 구체적으로 표시합니다.
 """
 import pandas as pd
 import numpy as np
@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 
 class ScalpingStrategy(BaseStrategy):
-    """지능형 울티메이트 스캘핑 전략 (브리핑 기능 포함)."""
+    """지능형 울티메이트 스캘핑 전략 (브리핑 세분화)."""
 
     def __init__(self):
         self.fee_rate = 0.0005
@@ -25,13 +25,11 @@ class ScalpingStrategy(BaseStrategy):
         self.vwap = None
         self.atr = None
         self.is_15m_uptrend = False
-        self.rsi_15m = 50
+        self.rsi_15m = None # None으로 초기화
         self.max_price = 0
         self.is_trailing = False
         self.entry_atr = 0
-        
-        # [신규] 판단 근거 저장용
-        self.last_reason = "지표 계산 중..."
+        self.last_reason = "데이터 수집 중..."
 
     def reset_trailing_state(self):
         self.max_price = 0
@@ -39,46 +37,58 @@ class ScalpingStrategy(BaseStrategy):
         self.entry_atr = 0
 
     async def update_indicators(self, ohlcv_1m: List[List[Any]], ohlcv_15m: List[List[Any]] = None):
-        if not ohlcv_1m or len(ohlcv_1m) < 30: return
+        if not ohlcv_1m or len(ohlcv_1m) < 30: 
+            self.last_reason = "1분봉 데이터 부족 (로딩 중)"
+            return
+            
         df = pd.DataFrame(ohlcv_1m, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
         df['date'] = pd.to_datetime(df['datetime'], unit='ms').dt.date
         df['tp'] = (df['high'] + df['low'] + df['close']) / 3
         df['cum_vol_price'] = df.groupby('date')['tp'].transform(lambda x: (x * df['volume']).cumsum())
         df['cum_vol'] = df.groupby('date')['volume'].transform('cumsum')
         self.vwap = (df['cum_vol_price'] / df['cum_vol']).iloc[-1]
+        
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         self.rsi = (100 - (100 / (1 + (gain / loss)))).iloc[-1]
         self.ma_5 = df['close'].rolling(5).mean().iloc[-1]
         self.ma_20 = df['close'].rolling(20).mean().iloc[-1]
+        
         df['tr'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1))))
         self.atr = df['tr'].rolling(20).mean().iloc[-1]
+        
         avg_vol = df['volume'].iloc[-6:-1].mean()
         self.volume_ratio = df['volume'].iloc[-1] / avg_vol if avg_vol > 0 else 1.0
 
-        if ohlcv_15m and len(ohlcv_15m) >= 20:
-            df15 = pd.DataFrame(ohlcv_15m, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-            ema9_15 = df15['close'].ewm(span=9).mean().iloc[-1]
-            ema21_15 = df15['close'].ewm(span=21).mean().iloc[-1]
-            d15 = df15['close'].diff()
-            g15 = (d15.where(d15 > 0, 0)).rolling(14).mean()
-            l15 = (-d15.where(d15 < 0, 0)).rolling(14).mean()
-            self.rsi_15m = (100 - (100 / (1 + (g15 / l15)))).iloc[-1]
-            self.is_15m_uptrend = (ema9_15 > ema21_15) or (self.rsi_15m > 55)
+        if not ohlcv_15m or len(ohlcv_15m) < 20:
+            self.last_reason = "15분봉 데이터 부족 (로딩 중)"
+            return
+
+        df15 = pd.DataFrame(ohlcv_15m, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+        ema9_15 = df15['close'].ewm(span=9).mean().iloc[-1]
+        ema21_15 = df15['close'].ewm(span=21).mean().iloc[-1]
+        d15 = df15['close'].diff()
+        g15 = (d15.where(d15 > 0, 0)).rolling(14).mean()
+        l15 = (-d15.where(d15 < 0, 0)).rolling(14).mean()
+        self.rsi_15m = (100 - (100 / (1 + (g15 / l15)))).iloc[-1]
+        self.is_15m_uptrend = (ema9_15 > ema21_15) or (self.rsi_15m > 55)
 
     def calculate_confidence(self) -> float:
         score = 1.0
-        if self.rsi_15m > 60: score += 0.2
+        if self.rsi_15m and self.rsi_15m > 60: score += 0.2
         if self.volume_ratio > 2.0: score += 0.2
-        if self.rsi < 40: score -= 0.2
+        if self.rsi and self.rsi < 40: score -= 0.2
         return max(0.5, min(1.5, score))
 
     async def check_signal(self, current_data: Dict[str, Any]) -> bool:
-        """진입 판단 및 사유 기록."""
+        """진입 판단 및 사유 기록 (None 체크 보강)."""
+        if self.rsi is None or self.vwap is None or self.rsi_15m is None:
+            self.last_reason = "지표 계산 완료 대기 중..."
+            return False
+            
         current_price = current_data['last']
         
-        # 판단 근거를 실시간으로 업데이트
         if not self.is_15m_uptrend:
             self.last_reason = f"🔭 15분봉 추세 하락세 (RSI15m: {self.rsi_15m:.1f})"
             return False
@@ -95,7 +105,6 @@ class ScalpingStrategy(BaseStrategy):
             self.last_reason = f"거래량 부족 (평소 대비 {self.volume_ratio:.1f}배)"
             return False
 
-        # 모든 조건 통과 시
         self.last_reason = f"✅ 모든 조건 충족 (15m추세+VWAP돌파+거래량 {self.volume_ratio:.1f}배)"
         self.reset_trailing_state()
         self.max_price = current_price
@@ -109,8 +118,12 @@ class ScalpingStrategy(BaseStrategy):
                 return "TL_시간제한"
         raw_pnl = (current_price - entry_price) / entry_price
         net_pnl = raw_pnl - (self.fee_rate * 2)
-        dynamic_sl_pct = max(0.002, min(0.005, (self.entry_atr / entry_price) * 1.5))
-        dynamic_tp_pct = max(0.003, min(0.008, (self.entry_atr / entry_price) * 2.5))
+        
+        # entry_atr이 0일 경우(초기화 에러 대비) 기본값 설정
+        atr_val = self.entry_atr if self.entry_atr > 0 else (entry_price * 0.002)
+        dynamic_sl_pct = max(0.002, min(0.005, (atr_val / entry_price) * 1.5))
+        dynamic_tp_pct = max(0.003, min(0.008, (atr_val / entry_price) * 2.5))
+        
         if current_price > self.max_price: self.max_price = current_price
         if net_pnl <= -dynamic_sl_pct: return f"SL_가변손절({dynamic_sl_pct:.2%})"
         if self.max_price >= entry_price * (1 + dynamic_tp_pct * 0.5):
