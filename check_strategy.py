@@ -28,7 +28,7 @@ async def test_current_market():
             print(f" - Vol Ratio: {strategy.volume_ratio:.2f}")
             print(f" - Trend (MA5 > MA20): {strategy.ma_5 > strategy.ma_20}")
             
-            is_buy = await strategy.check_signal(ticker, {"confidence_score": 0.5})
+            is_buy = await strategy.check_signal(ticker)
             print(f" - Signal: {'BUY' if is_buy else 'WAIT'}")
                 
         except Exception as e:

@@ -8,8 +8,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 from src.connector.exchange_base import ExchangeConnector
-from src.learner.online_learner import OnlineLearner
-from src.learner.schema import TradeEvent, ExecutionResult
 from src.strategy.scalping_strategy import ScalpingStrategy
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.learner.utils import get_logger, now_utc
@@ -23,7 +21,6 @@ class StrategyManager:
     def __init__(self):
         """초기화 및 설정 로드."""
         self.connector = ExchangeConnector()
-        self.learner = OnlineLearner()
         self.notifier = TelegramNotifier()
         self.is_running = False
         self.is_paused = False
@@ -138,7 +135,7 @@ class StrategyManager:
         """메인 실행 루프."""
         self.is_running = True
         symbols_list_str = ", ".join([s.split('/')[0] for s in self.symbols])
-        await self.notifier.send_message(f"💎 AI 매매 시스템 가동 (실시간 추적 강화)\n대상: {symbols_list_str}")
+        await self.notifier.send_message(f"💎 자동 매매 시스템 가동 (실시간 추적 강화)\n대상: {symbols_list_str}")
         
         await self._update_all_indicators()
 
@@ -189,14 +186,8 @@ class StrategyManager:
 
             ticker = await self.connector.fetch_ticker(symbol)
             if not ticker: return
-
-            event = TradeEvent(
-                trace_id=f"t_{int(now.timestamp())}", exchange=self.connector.exchange_id, 
-                symbol=symbol, side="buy", price=ticker['last'], quantity=0
-            )
-            ai_pred = await self.learner.predict(event)
             
-            if await data['strategies']['trend'].check_signal(ticker, ai_pred.model_dump()):
+            if await data['strategies']['trend'].check_signal(ticker):
                 await self._execute_buy(symbol, ticker, "trend")
 
         except Exception as e:
@@ -208,7 +199,6 @@ class StrategyManager:
             balance = await self.connector.fetch_balance()
             coin_code = symbol.split('/')[0]
             
-            # 가상 모드일 때는 항상 수량이 있다고 가정 (테스트 버그 수정)
             if self.connector.is_dry_run:
                 actual_amount = 1.0 
             else:
@@ -231,10 +221,6 @@ class StrategyManager:
                 self.coin_data[symbol]['last_sell_time'] = now_utc()
                 self.coin_data[symbol]['position'] = None
                 
-                await self.learner.feedback(ExecutionResult(
-                    order_id=order.get('id', 'unknown'), 
-                    filled_price=ticker['last'], pnl_pct=pnl/100.0, strategy_type=pos['strategy_type']
-                ))
         except Exception as e:
             logger.error(f"[{symbol}] 매도 실행 실패: {e}")
             if self.coin_data[symbol]['position']:

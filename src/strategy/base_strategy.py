@@ -3,7 +3,6 @@
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Any
-from src.learner.schema import TradeEvent
 
 class BaseStrategy(ABC):
     """모든 전략의 부모 클래스."""
