@@ -1,6 +1,6 @@
 """
-[울티메이트 전략 관리자 - 브리핑 기능 강화]
-보고서 요청 시 현재 포지션의 구매 사유와 관망 사유를 브리핑합니다.
+[울티메이트 전략 관리자 - 보고서 로직 보강]
+주도주가 아니더라도 분석 상태를 보여주도록 수정되었습니다.
 """
 import asyncio
 import os
@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 
 class StrategyManager:
-    """울티메이트 트레이딩 시스템 (브리핑 기능 포함)."""
+    """울티메이트 트레이딩 시스템 (보고서 보강)."""
 
     def __init__(self):
         self.connector = ExchangeConnector()
@@ -49,15 +49,21 @@ class StrategyManager:
         scores = []
         for symbol in self.symbols:
             try:
+                # 15분봉 거래소 요청
                 ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe='15m', limit=5)
-                if len(ohlcv) < 5: continue
+                if len(ohlcv) < 5: 
+                    # 데이터 부족 시 전략 상태에도 기록
+                    self.coin_data[symbol]['strategies']['trend'].last_reason = "⏳ 주도주 분석용 15분봉 데이터 부족"
+                    continue
                 df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
                 change = (df['c'].iloc[-1] - df['c'].iloc[-4]) / df['c'].iloc[-4]
                 vol_avg = df['v'].mean()
                 score = (change * 100 * 0.7) + (vol_avg / 1000000 * 0.3)
                 self.coin_data[symbol]['score'] = score
                 scores.append((symbol, score))
-            except: continue
+            except Exception as e:
+                logger.error(f"주도주 분석 에러 ({symbol}): {e}")
+                continue
         scores.sort(key=lambda x: x[1], reverse=True)
         self.hot_symbols = [s[0] for s in scores[:5]]
 
@@ -66,9 +72,16 @@ class StrategyManager:
             try:
                 ohlcv_1m = await self.connector.fetch_ohlcv(symbol, timeframe='1m', limit=100)
                 ohlcv_15m = await self.connector.fetch_ohlcv(symbol, timeframe='15m', limit=50)
-                if ohlcv_1m and len(ohlcv_1m) >= 30:
-                    strategy = self.coin_data[symbol]['strategies']['trend']
+                
+                strategy = self.coin_data[symbol]['strategies']['trend']
+                # 데이터가 아예 안 오는지 체크
+                if not ohlcv_1m:
+                    strategy.last_reason = "❌ 거래소 응답 없음 (1분봉)"
+                elif not ohlcv_15m:
+                    strategy.last_reason = "❌ 거래소 응답 없음 (15분봉)"
+                else:
                     await strategy.update_indicators(ohlcv_1m, ohlcv_15m)
+                
                 await asyncio.sleep(0.1)
             except Exception as e: logger.error(f"[{symbol}] 지표 업데이트 실패: {e}")
         self.last_indicator_update = now_utc()
@@ -76,45 +89,33 @@ class StrategyManager:
 
     async def _process_trading_logic(self, symbol: str, now: datetime):
         try:
-            if symbol not in self.hot_symbols: return
             data = self.coin_data[symbol]
+            strategy = data['strategies']['trend']
+
+            # 주도주가 아닌 경우 상태 업데이트
+            if symbol not in self.hot_symbols:
+                if "수집 중" not in strategy.last_reason and "응답 없음" not in strategy.last_reason:
+                    strategy.last_reason = "💤 관망 중 (비주도주)"
+                return
+
             if data['position']: return
-            if data['last_sell_time'] and (now - data['last_sell_time']).total_seconds() < 300: return
-            if not self.is_market_safe: return
+            if data['last_sell_time'] and (now - data['last_sell_time']).total_seconds() < 300: 
+                strategy.last_reason = "⏳ 매도 후 재진입 유예 시간"
+                return
+            if not self.is_market_safe: 
+                strategy.last_reason = "⚠️ 시장 주의 상태 (BTC 급락)"
+                return
+
             ticker = await self.connector.fetch_ticker(symbol)
             if not ticker: return
-            strategy = data['strategies']['trend']
+            
             if await strategy.check_signal(ticker):
                 confidence = strategy.calculate_confidence()
-                # 진입 당시의 사유를 기록
                 entry_reason = strategy.last_reason
                 await self._execute_buy(symbol, ticker, "trend", confidence, entry_reason)
         except Exception as e: logger.error(f"[{symbol}] 매수 탐색 오류: {e}")
 
-    async def _execute_buy(self, symbol: str, ticker: Dict[str, Any], strategy_type: str, confidence: float, entry_reason: str):
-        try:
-            active_positions = sum(1 for s in self.symbols if self.coin_data[s]['position'] is not None)
-            if active_positions >= self.max_positions: return
-            balance = await self.connector.fetch_balance()
-            krw_free = balance.get('free', {}).get('KRW', 0)
-            remaining_slots = self.max_positions - active_positions
-            base_invest = (krw_free / remaining_slots) * 0.95
-            final_invest = base_invest * confidence
-            if final_invest < 5050: return 
-            order = await self.connector.create_order(symbol, "buy", final_invest)
-            if order:
-                self.coin_data[symbol]['position'] = {
-                    'entry_price': ticker['last'], 
-                    'strategy_type': strategy_type,
-                    'state': 'active',
-                    'entry_time': now_utc(),
-                    'confidence': confidence,
-                    'entry_reason': entry_reason # 구매 사유 저장
-                }
-                await self.notifier.send_message(f"🚀 [매수] {symbol}\n사유: {entry_reason}\n진입가: {ticker['last']:,.0f}")
-        except Exception as e: logger.error(f"[{symbol}] 매수 실패: {e}")
-
-    # (생략된 기존 관리 로직들 유지)
+    # (이하 생략된 기존 메서드들은 유지됨)
     async def _init_daily_balance(self):
         balance = await self.connector.fetch_balance()
         total_krw = balance.get('total', {}).get('KRW', 0)
@@ -181,6 +182,29 @@ class StrategyManager:
                 self.coin_data[symbol]['position'] = None
         except Exception as e: logger.error(f"[{symbol}] 매도 실패: {e}")
 
+    async def _execute_buy(self, symbol: str, ticker: Dict[str, Any], strategy_type: str, confidence: float, entry_reason: str):
+        try:
+            active_positions = sum(1 for s in self.symbols if self.coin_data[s]['position'] is not None)
+            if active_positions >= self.max_positions: return
+            balance = await self.connector.fetch_balance()
+            krw_free = balance.get('free', {}).get('KRW', 0)
+            remaining_slots = self.max_positions - active_positions
+            base_invest = (krw_free / remaining_slots) * 0.95
+            final_invest = base_invest * confidence
+            if final_invest < 5050: return 
+            order = await self.connector.create_order(symbol, "buy", final_invest)
+            if order:
+                self.coin_data[symbol]['position'] = {
+                    'entry_price': ticker['last'], 
+                    'strategy_type': strategy_type,
+                    'state': 'active',
+                    'entry_time': now_utc(),
+                    'confidence': confidence,
+                    'entry_reason': entry_reason
+                }
+                await self.notifier.send_message(f"🚀 [매수] {symbol}\n사유: {entry_reason}\n진입가: {ticker['last']:,.0f}")
+        except Exception as e: logger.error(f"[{symbol}] 매수 실패: {e}")
+
     async def _process_commands(self):
         cmd = await self.notifier.get_recent_command()
         if not cmd: return
@@ -193,7 +217,7 @@ class StrategyManager:
     async def start(self):
         self.is_running = True
         await self._init_daily_balance()
-        await self.notifier.send_message("🌌 울티메이트 시스템 가동 (브리핑 기능 활성화)")
+        await self.notifier.send_message("🌌 울티메이트 시스템 가동 (브리핑 로직 보강)")
         await self._update_all_indicators()
         asyncio.create_task(self._monitor_positions_loop())
         while self.is_running:
@@ -217,7 +241,6 @@ class StrategyManager:
             await asyncio.sleep(0.5)
 
     async def _send_status_report(self, is_daily_summary: bool = False):
-        """현재 상태 및 관망/보유 사유 브리핑 보고서."""
         try:
             balance = await self.connector.fetch_balance()
             krw = balance.get('free', {}).get('KRW', 0)
@@ -234,15 +257,18 @@ class StrategyManager:
                     msg += f"  └ 사유: {p.get('entry_reason', '기록 없음')}\n"
             else:
                 msg += "\n[현재 관망 사유]\n"
-                # 주도주 1위 종목의 관망 사유를 대표로 보여줌
                 if self.hot_symbols:
                     top_coin = self.hot_symbols[0]
                     reason = self.coin_data[top_coin]['strategies']['trend'].last_reason
-                    msg += f"- {top_coin.split('/')[0]} 감시 중: {reason}\n"
+                    msg += f"- {top_coin.split('/')[0]} (주도주 1위): {reason}\n"
                 else:
-                    msg += "- 주도주 분석 중입니다...\n"
+                    # 주도주가 하나도 없을 때 (데이터 수집 문제 등)
+                    msg += "- ⚠️ 주도주 선별 실패 (데이터 수집 상태 확인 필요)\n"
+                    for s in self.symbols[:3]:
+                        r = self.coin_data[s]['strategies']['trend'].last_reason
+                        msg += f"  └ {s.split('/')[0]}: {r}\n"
             
-            msg += f"\n🔥 주도주: {', '.join([s.split('/')[0] for s in self.hot_symbols[:3]])}"
+            msg += f"\n🔥 주도주 리스트: {', '.join([s.split('/')[0] for s in self.hot_symbols[:3]])}"
             await self.notifier.send_message(msg)
         except Exception as e: logger.error(f"보고서 생성 실패: {e}")
 
